@@ -8,39 +8,39 @@
   var CFG = {
     // Agent (Forcepoint engine) na localhost
     agentPort: 55299,
-    agentBase: null,                 // wyliczane
+    agentBase: null, // wyliczane
 
     // Endpointy zgodne z Forcepoint (olk.exe)
     pingPath: "FirefoxExt/_1",
     classifyPath: "OutlookAddin",
 
-    // Fail policy
-    failClosed: false,               // DEV: false = fail-open
+    // Fail policy (dla błędów sieci/parsowania itp.)
+    // false = fail-open (domyślnie DEV), true = fail-closed
+    failClosed: false,
 
-    // Timeouts (krótkie żeby nie wieszać send)
-    hardTimeoutMs: 12000,            // watchdog całego OnSend
+    // Timeouts
+    hardTimeoutMs: 12000,    // watchdog całego OnSend
     pingTimeoutMs: 1500,
     collectTimeoutMs: 4000,
     classifyTimeoutMs: 7000,
 
     // CORS/preflight workaround:
-    // - "application/json; charset=utf-8" (normalnie, ale generuje preflight OPTIONS)
-    // - "text/plain; charset=utf-8" (często bez preflight; serwer musi umieć parsować JSON z text/plain)
+    // - application/json (normalnie, ale robi preflight OPTIONS)
+    // - text/plain (często bez preflight; serwer musi umieć parsować JSON z text/plain)
     postContentType: "application/json; charset=utf-8",
 
     // Logging
-    debugLevel: 3,                   // 0 OFF, 1 ERR, 2 INF, 3 DBG
+    debugLevel: 3, // 0 OFF, 1 ERR, 2 INF, 3 DBG
     persistLocalStorage: true,
     localStorageKeyLogs: "DLP_DEV_LOGS",
     localStorageKeyCfg: "DLP_DEV_CFG",
 
-    // log sink (opcjonalnie): endpoint, który zapisuje logi do pliku po stronie localhost
-    // np. https://localhost:55298/DevLog/_1
+    // opcjonalny log sink (endpoint na localhost zapisujący log do pliku)
     logSinkUrl: "",
 
     // Kontrola logowania treści
-    logBodyHtml: true,               // loguj surowy HTML (DBG)
-    maxBodyLogChars: 6000            // limit na dump (żeby nie zabić konsoli)
+    logBodyHtml: true,
+    maxBodyLogChars: 6000
   };
 
   // =========================================================
@@ -81,6 +81,13 @@
     try { return new Date().toISOString(); } catch (e) { return "" + (new Date()); }
   }
 
+  function truncateForLog(s) {
+    if (!s) return "";
+    var t = String(s);
+    if (t.length <= CFG.maxBodyLogChars) return t;
+    return t.slice(0, CFG.maxBodyLogChars) + "\n...[truncated]...";
+  }
+
   function pushLog(level, tx, msg, data) {
     var entry = { ts: nowIso(), lvl: level, tx: tx, msg: msg, data: data || null };
 
@@ -91,14 +98,12 @@
       try { localStorage.setItem(CFG.localStorageKeyLogs, JSON.stringify(_buf)); } catch (e) {}
     }
 
-    // Console formatting similar-ish to your logs
     try {
       var line = entry.ts + " [" + level + "] [" + tx + "] " + msg;
       if (data !== undefined && data !== null) console.log(line, data);
       else console.log(line);
     } catch (e2) {}
 
-    // Optional log sink (fire-and-forget)
     if (CFG.logSinkUrl) {
       try {
         var x = new XMLHttpRequest();
@@ -117,12 +122,12 @@
   window.DLP_DEV_DUMP = function () { try { return _buf.slice(); } catch (e) { return []; } };
 
   // =========================================================
-  // UI notifications (krótkie)
+  // UI notifications
   // =========================================================
   function notify(type, message) {
     try {
       var item = Office.context.mailbox.item;
-      item.notificationMessages.replaceAsync("dlp-dev", {
+      item.notificationMessages.replaceAsync("NoSend", {
         type: type,
         message: message,
         icon: "icon16",
@@ -132,7 +137,7 @@
   }
 
   // =========================================================
-  // XHR helper - callback ONCE (fix dublowania HTTP0/network)
+  // XHR helper - callback ONCE
   // =========================================================
   function xhr(method, url, payload, timeoutMs, headers, cb) {
     var x = new XMLHttpRequest();
@@ -168,22 +173,18 @@
         for (var h in headers) if (headers.hasOwnProperty(h)) x.setRequestHeader(h, headers[h]);
       }
 
-      if (payload !== undefined && payload !== null) {
-        x.send(payload);
-      } else {
-        x.send();
-      }
+      if (payload !== undefined && payload !== null) x.send(payload);
+      else x.send();
     } catch (e) {
       finish(e, null);
     }
   }
 
   // =========================================================
-  // HTML -> normalized text (DEV)
+  // HTML -> normalized text
   // =========================================================
   function normalizeText(s) {
     if (!s) return "";
-    // collapse whitespace + normalize newlines
     return String(s)
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n")
@@ -196,18 +197,16 @@
     try {
       var div = document.createElement("div");
       div.innerHTML = html;
+
+      // kluczowe: usuń style/script, bo textContent je uwzględnia
+      var nodes = div.querySelectorAll("style,script");
+      for (var i = 0; i < nodes.length; i++) nodes[i].remove();
+
       var text = div.textContent || div.innerText || "";
       return normalizeText(text);
     } catch (e) {
       return "";
     }
-  }
-
-  function truncateForLog(s) {
-    if (!s) return "";
-    var t = String(s);
-    if (t.length <= CFG.maxBodyLogChars) return t;
-    return t.slice(0, CFG.maxBodyLogChars) + "\n...[truncated]...";
   }
 
   // =========================================================
@@ -249,7 +248,7 @@
 
     var data = {
       subject: "",
-      body: "", // normalized text for classifier
+      body: "", // normalized text
       from: {
         emailAddress: (fromProfile && fromProfile.emailAddress) ? fromProfile.emailAddress : "",
         displayName: (fromProfile && fromProfile.displayName) ? fromProfile.displayName : ""
@@ -291,20 +290,16 @@
       });
     } catch (e) { one(); }
 
-    // body HTML (for logs + normalization)
-    var gotHtml = false;
-    var htmlValue = "";
-
+    // body HTML -> normalized text + debug dumps
     try {
       item.body.getAsync(Office.CoercionType.Html, function (r) {
         if (r && r.status === Office.AsyncResultStatus.Succeeded) {
-          gotHtml = true;
-          htmlValue = r.value || "";
+          var html = r.value || "";
           if (CFG.debugLevel >= 3 && CFG.logBodyHtml) {
             logD(tx, "=== Raw HTML Body ===");
-            logD(tx, truncateForLog(htmlValue));
+            logD(tx, truncateForLog(html));
           }
-          var norm = htmlToText(htmlValue);
+          var norm = htmlToText(html);
           if (CFG.debugLevel >= 3) {
             logD(tx, "=== Normalized Text ===");
             logD(tx, truncateForLog(norm));
@@ -313,7 +308,7 @@
         }
         one();
       });
-    } catch (e) { one(); }
+    } catch (e2) { one(); }
 
     // recipients
     try {
@@ -321,35 +316,31 @@
         if (r && r.status === Office.AsyncResultStatus.Succeeded) data.to = mapRecipsToObjects(r.value);
         one();
       });
-    } catch (e) { one(); }
+    } catch (e3) { one(); }
 
     try {
       item.cc.getAsync(function (r) {
         if (r && r.status === Office.AsyncResultStatus.Succeeded) data.cc = mapRecipsToObjects(r.value);
         one();
       });
-    } catch (e) { one(); }
+    } catch (e4) { one(); }
 
     try {
       item.bcc.getAsync(function (r) {
         if (r && r.status === Office.AsyncResultStatus.Succeeded) data.bcc = mapRecipsToObjects(r.value);
         one();
       });
-    } catch (e) { one(); }
+    } catch (e5) { one(); }
 
-    // attachments + location (sync-ish)
+    // attachments + location
     try {
       data.attachments = mapAttachments(item);
-      try { logD(tx, "Attachment list size: " + data.attachments.length); } catch (e2) {}
-    } catch (e3) {}
+      logD(tx, "Attachment list size: " + data.attachments.length);
+    } catch (e6) {}
 
-    // location (appointment)
     try {
-      if (item.itemType === "appointment") {
-        // w praktyce często jest string; jeśli nie, zostaw ""
-        data.location = item.location || "";
-      }
-    } catch (e4) {}
+      if (item.itemType === "appointment") data.location = item.location || "";
+    } catch (e7) {}
 
     one();
   }
@@ -380,10 +371,9 @@
     logI(tx, "FP email validation started - [v1.2]");
     try {
       var plat = Office.context && Office.context.diagnostics && Office.context.diagnostics.platform;
-      // classic Outlook on Windows typically "PC"
       if (plat === "Mac") logI(tx, "MacOS detected");
       else logI(tx, "WindowsOS detected");
-    } catch (e) {}
+    } catch (e0) {}
 
     logI(tx, "Validating message");
     notify("informationalMessage", "DLP DEV: sprawdzanie...");
@@ -408,6 +398,7 @@
     xhr("GET", pingUrl, null, CFG.pingTimeoutMs, null, function (pingErr) {
       if (pingErr) {
         logE(tx, "Server is down", { err: pingErr.message, url: pingUrl, ms: ms() });
+
         if (CFG.failClosed) {
           notify("errorMessage", "DLP DEV: agent nieosiągalny – blokuję (fail-closed).");
           finish(false, "agent_unreachable");
@@ -426,19 +417,20 @@
 
       var item = Office.context.mailbox.item;
 
-      collectItemData(item, tx, function (payload) {
+      collectItemData(item, tx, function (payloadObj) {
         logD(tx, "Sending event to classifier");
 
         // 3) send to classifier
         var classifyUrl = CFG.agentBase + CFG.classifyPath;
 
-        // payload as Forcepoint-ish JSON
-        var body = JSON.stringify(payload);
+        // payload string
+        var payloadStr = JSON.stringify(payloadObj);
+
         var headers = { "Content-Type": CFG.postContentType };
 
-        xhr("POST", classifyUrl, body, CFG.classifyTimeoutMs, headers, function (classErr, respText) {
+        xhr("POST", classifyUrl, payloadStr, CFG.classifyTimeoutMs, headers, function (classErr, respText) {
           if (classErr) {
-            // Status 0 / network usually means CORS/preflight blocked or TLS issue
+            // HTTP 0 / network -> zwykle CORS/preflight/TLS
             logE(tx, "classify failed", { err: classErr.message, url: classifyUrl, ms: ms() });
 
             if (CFG.failClosed) {
@@ -454,26 +446,49 @@
           // Handle response from engine
           logI(tx, "Handling response from engine");
 
-          var allow = true;
-          var msg = "";
-
-          try {
-            var obj = safeJsonParse(respText || "{}") || {};
-            // Forcepoint convention: action==1 => allow
-            allow = (obj.action === 1);
-            msg = obj.msg || "";
-          } catch (e) {
-            allow = !CFG.failClosed;
-            msg = "Invalid response";
+          if (CFG.debugLevel >= 3) {
+            logD(tx, "Engine raw response (truncated)");
+            logD(tx, truncateForLog(respText || ""));
           }
+
+          var obj = safeJsonParse(respText || "{}");
+          if (!obj) {
+            // jeśli odpowiedź nie-JSON
+            logE(tx, "Engine response is not JSON");
+
+            if (CFG.failClosed) {
+              notify("errorMessage", "Blocked by DLP engine (invalid response).");
+              finish(false, "invalid_response_fail_closed");
+            } else {
+              // fail-open
+              logI(tx, "DLP allow. (invalid response -> fail-open)");
+              notify("informationalMessage", "DLP DEV: OK – wysyłka dozwolona.");
+              finish(true, "invalid_response_fail_open");
+            }
+            return;
+          }
+
+          // =====================================================
+          // FORCEPOINT SEMANTICS (jak w Twoim olk.exe):
+          // action == 1  => BLOCK
+          // else         => ALLOW
+          // =====================================================
+          var actionVal = obj.action;
+          if (typeof actionVal === "string") actionVal = actionVal.trim();
+
+          var isBlock = (actionVal === 1 || actionVal === "1");
+          var allow = !isBlock;
+
+          var msg = obj.msg || obj.message || obj.reason || "";
 
           if (allow) {
             logI(tx, "DLP allow.");
             notify("informationalMessage", "DLP DEV: OK – wysyłka dozwolona.");
             finish(true, "allowed");
           } else {
-            logI(tx, "DLP block.", { msg: msg });
-            notify("errorMessage", msg ? ("DLP DEV: Zablokowano: " + msg) : "DLP DEV: Zablokowano.");
+            logI(tx, "DLP block.", { action: actionVal, msg: msg });
+            // jak w olk.exe: stały komunikat, nawet jeśli msg puste
+            notify("errorMessage", msg ? ("Blocked by DLP engine: " + msg) : "Blocked by DLP engine");
             finish(false, "blocked");
           }
         });
