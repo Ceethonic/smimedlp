@@ -1,708 +1,443 @@
 /* global Office */
-(function () {
-  "use strict";
 
-  // =========================================================
-  // DEV CONFIG (nadpisywana przez localStorage: DLP_DEV_CFG)
-  // =========================================================
-  var CFG = {
-    agentPort: 55299,
-    agentBase: null,
+// Forcepoint-like DEV implementation for classic Outlook (outlook.exe)
+// - body normalization matches Forcepoint (strip tags only, keep entities like &nbsp;)
+// - but first extracts <body> and removes MSO conditional XML comments to avoid "Clean/DocumentEmail/false..." noise
+// - attachments: getAttachmentsAsync + getAttachmentContentAsync => {file_name,data,content_type}
+// - response semantics: action === 1 => BLOCK else ALLOW
 
-    pingPath: "FirefoxExt/_1",
-    classifyPath: "OutlookAddin",
+let logEnable = false;
 
-    // false = fail-open, true = fail-closed
-    failClosed: false,
+// Forcepoint ports (as in original):
+// - Windows: 55299
+// - Mac:     55296
+let urlDseRoot = 'https://localhost:55299/';
 
-    // timeouty
-    hardTimeoutMs: 15000,
-    pingTimeoutMs: 1500,
-    fieldTimeoutMs: 3000,
-    bodyTimeoutMs: 6000,
-    attachmentsListTimeoutMs: 5000,
-    attachmentContentTimeoutMs: 30000,
-    classifyTimeoutMs: 12000,
+// Optional compatibility toggle for CORS/preflight in classic Outlook:
+// - keep identical to Forcepoint by default (Content-Type: application/json)
+// - if you still see HTTP 0 / network, set localStorage DLP_DEV_NO_CONTENT_TYPE = "1" to omit header
+let compatNoContentType = false;
 
-    // KLUCZOWE: domyślnie NIE ustawiamy Content-Type (jak często działa u Forcepoint)
-    // Ustaw tylko gdy musisz, np.:
-    // "application/json; charset=utf-8" albo "text/plain; charset=utf-8"
-    postContentType: "",
+// Load toggles from localStorage (dev convenience)
+(function loadDevToggles() {
+  try {
+    logEnable = (localStorage.getItem("DLP_DEV_LOG_ENABLE") === "1");
+    compatNoContentType = (localStorage.getItem("DLP_DEV_NO_CONTENT_TYPE") === "1");
+  } catch (e) {}
+})();
 
-    debugLevel: 3, // 0 OFF, 1 ERR, 2 INF, 3 DBG
-    persistLocalStorage: true,
-    localStorageKeyLogs: "DLP_DEV_LOGS",
-    localStorageKeyCfg: "DLP_DEV_CFG",
+Office.initialize = function () {};
 
-    logSinkUrl: "",
+function printLog(text) {
+  try { console.log(text); } catch (e) {}
 
-    logBodyHtml: true,
-    maxBodyLogChars: 6000
-  };
-
-  // =========================================================
-  // Storage CFG
-  // =========================================================
-  function safeJsonParse(s) { try { return JSON.parse(s); } catch (e) { return null; } }
-
-  function loadCfg() {
+  // Avoid any blocking waits here (sleep) – can cause send timeouts in classic Outlook.
+  if (logEnable && (typeof text === 'string' || text instanceof String)) {
     try {
-      var raw = localStorage.getItem(CFG.localStorageKeyCfg);
-      var obj = raw ? safeJsonParse(raw) : null;
-      if (!obj) return;
-      for (var k in obj) if (obj.hasOwnProperty(k) && CFG.hasOwnProperty(k)) CFG[k] = obj[k];
-    } catch (e) {}
-  }
-
-  function saveCfg() {
-    try { localStorage.setItem(CFG.localStorageKeyCfg, JSON.stringify(CFG)); } catch (e) {}
-  }
-
-  loadCfg();
-  CFG.agentBase = "https://localhost:" + CFG.agentPort + "/";
-
-  window.DLP_DEV_CFG_SAVE = function (newCfg) {
-    if (!newCfg) return;
-    for (var k in newCfg) if (newCfg.hasOwnProperty(k) && CFG.hasOwnProperty(k)) CFG[k] = newCfg[k];
-    CFG.agentBase = "https://localhost:" + CFG.agentPort + "/";
-    saveCfg();
-  };
-
-  // =========================================================
-  // Logging
-  // =========================================================
-  var _buf = [];
-
-  function nowIso() {
-    try { return new Date().toISOString(); } catch (e) { return "" + (new Date()); }
-  }
-
-  function truncateForLog(s) {
-    if (!s) return "";
-    var t = String(s);
-    if (t.length <= CFG.maxBodyLogChars) return t;
-    return t.slice(0, CFG.maxBodyLogChars) + "\n...[truncated]...";
-  }
-
-  function pushLog(level, tx, msg, data) {
-    var entry = { ts: nowIso(), lvl: level, tx: tx, msg: msg, data: data || null };
-
-    _buf.push(entry);
-    if (_buf.length > 800) _buf.shift();
-
-    if (CFG.persistLocalStorage) {
-      try { localStorage.setItem(CFG.localStorageKeyLogs, JSON.stringify(_buf)); } catch (e) {}
-    }
-
-    try {
-      var line = entry.ts + " [" + level + "] [" + tx + "] " + msg;
-      if (data !== undefined && data !== null) console.log(line, data);
-      else console.log(line);
-    } catch (e2) {}
-
-    if (CFG.logSinkUrl) {
-      try {
-        var x = new XMLHttpRequest();
-        x.open("POST", CFG.logSinkUrl, true);
-        x.timeout = 300;
-        x.setRequestHeader("Content-Type", "application/json; charset=utf-8");
-        x.send(JSON.stringify(entry));
-      } catch (e3) {}
-    }
-  }
-
-  function logE(tx, msg, data) { if (CFG.debugLevel >= 1) pushLog("ERR", tx, msg, data); }
-  function logI(tx, msg, data) { if (CFG.debugLevel >= 2) pushLog("INF", tx, msg, data); }
-  function logD(tx, msg, data) { if (CFG.debugLevel >= 3) pushLog("DBG", tx, msg, data); }
-
-  window.DLP_DEV_DUMP = function () { try { return _buf.slice(); } catch (e) { return []; } };
-
-  // =========================================================
-  // Outlook notifications (jak Forcepoint)
-  // =========================================================
-  function notifyBlocked(messageText) {
-    try {
-      var item = Office.context.mailbox.item;
-      item.notificationMessages.addAsync("NoSend", {
-        type: "errorMessage",
-        message: messageText || "Blocked by DLP engine"
+      Office.context.mailbox.item.notificationMessages.replaceAsync("succeeded", {
+        type: "progressIndicator",
+        message: text.substring(0, Math.min(text.length, 250)),
       });
     } catch (e) {}
   }
+}
 
-  function notifyInfo(messageText) {
-    try {
-      var item = Office.context.mailbox.item;
-      item.notificationMessages.replaceAsync("DlpInfo", {
-        type: "informationalMessage",
-        message: messageText || "",
-        icon: "icon16",
-        persistent: false
-      });
-    } catch (e) {}
+function handleError(data, event) {
+  printLog(data);
+  printLog("Completing event");
+  try { event.completed({ allowEvent: true }); } catch (e) {}
+  printLog("Event Completed");
+}
+
+function operatingSytem() {
+  // Forcepoint mapping:
+  // - 'Mac' => MacOS
+  // - 'OfficeOnline' treated as WindowsOS (Forcepoint logic)
+  // In classic Outlook you'll often see 'PC' – treat it as WindowsOS too.
+  try {
+    var platform = Office.context.diagnostics.platform;
+    if (platform === 'Mac') return 'MacOS';
+    if (platform === 'OfficeOnline' || platform === 'PC') return 'WindowsOS';
+    return 'Other';
+  } catch (e) {
+    return 'Other';
   }
+}
 
-  // =========================================================
-  // XHR helper - callback ONCE
-  // =========================================================
-  function xhr(method, url, payload, timeoutMs, headers, cb) {
-    var x = new XMLHttpRequest();
-    var done = false;
+// --- HTML normalization exactly "Forcepoint-like" output ---
+// Goal: produce body string similar to Forcepoint olk.exe: e.g. "ilovepizza&nbsp;"
+// - keep "&nbsp;" literally (do not decode)
+// - remove tags only
+// - BUT: first strip <head> and MSO conditional comments and extract <body> to avoid junk
+function extractBodyAndCleanMso(html) {
+  let s = String(html || "");
 
-    function finish(err, text) {
-      if (done) return;
-      done = true;
-      try {
-        x.onreadystatechange = null;
-        x.onerror = null;
-        x.ontimeout = null;
-        x.onabort = null;
-      } catch (e) {}
-      cb(err, text);
+  // Remove <head>...</head> entirely (Word HTML puts tons of metadata there)
+  s = s.replace(/<head[\s\S]*?<\/head>/gi, "");
+
+  // Remove MSO conditional comments that embed <xml> (these produce "Clean", "DocumentEmail", "false"...)
+  // Example: <!--[if gte mso 9]><xml> ... </xml><![endif]-->
+  s = s.replace(/<!--\s*\[if[\s\S]*?<!\s*\[endif\]\s*-->/gi, "");
+
+  // Try to extract <body>...</body>
+  const m = s.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+  if (m && m[1] !== undefined) return m[1];
+
+  // Fallback: sometimes Outlook returns fragment without <body>
+  return s;
+}
+
+function normalizeHtmlToForcepointPlainText(htmlBody) {
+  // Forcepoint core rule: strip tags only, keep entities like &nbsp;
+  const cleaned = extractBodyAndCleanMso(htmlBody);
+  return cleaned.replace(/<[^>]+>/g, '');
+}
+
+// --- Network helpers (Forcepoint-style: fetch + AbortController timeouts) ---
+function fetchWithTimeout(url, options, timeoutMs) {
+  // AbortController may not exist in older runtimes; fallback to plain fetch
+  if (typeof AbortController === "undefined") {
+    return fetch(url, options);
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  options = options || {};
+  options.signal = controller.signal;
+
+  return fetch(url, options).finally(() => clearTimeout(timeout));
+}
+
+async function httpServerCheck(resolve, reject) {
+  printLog("Checking the server");
+
+  fetchWithTimeout(urlDseRoot + 'FirefoxExt/_1', {
+    method: 'GET',
+    mode: 'cors',
+    cache: 'no-cache',
+    credentials: 'same-origin',
+    redirect: 'follow',
+    referrerPolicy: 'no-referrer',
+  }, 30000).then(response => {
+    if (!response.ok) {
+      printLog("Server is down");
+      reject(false);
+    } else {
+      printLog("Server is UP");
+      resolve(true);
     }
+  }).catch(e => {
+    printLog("Request crashed");
+    reject(false);
+  });
+}
 
-    try {
-      x.open(method, url, true);
-      x.timeout = timeoutMs;
+async function sendToClasifier(url = '', data = {}, event) {
+  printLog("Sending event to classifier");
 
-      x.onreadystatechange = function () {
-        if (x.readyState !== 4) return;
-        if (x.status >= 200 && x.status < 300) finish(null, x.responseText || "");
-        else finish(new Error("HTTP " + x.status), null);
-      };
+  const headers = {};
+  // Forcepoint original sets JSON header; keep it by default
+  // Optional compat: omit to avoid preflight in some classic Outlook/CORS setups
+  if (!compatNoContentType) headers['Content-Type'] = 'application/json';
 
-      x.onerror = function () { finish(new Error("network"), null); };
-      x.ontimeout = function () { finish(new Error("timeout"), null); };
-      x.onabort = function () { finish(new Error("abort"), null); };
-
-      if (headers) {
-        for (var h in headers) if (headers.hasOwnProperty(h)) x.setRequestHeader(h, headers[h]);
-      }
-
-      if (payload !== undefined && payload !== null) x.send(payload);
-      else x.send();
-    } catch (e) {
-      finish(e, null);
+  fetchWithTimeout(url, {
+    method: 'POST',
+    mode: 'cors',
+    cache: 'no-cache',
+    credentials: 'same-origin',
+    headers: headers,
+    redirect: 'follow',
+    referrerPolicy: 'no-referrer',
+    body: JSON.stringify(data)
+  }, 35000).then(response => {
+    if (!response.ok) {
+      printLog("Engine returned error: " + response.status);
+      handleError(response.status, event);
+      // still try to parse if possible
     }
-  }
-
-  // =========================================================
-  // getAsync z timeoutem (Forcepoint-style)
-  // =========================================================
-  function getAsyncValue(getter, timeoutMs, onValue) {
-    var done = false;
-    var timer = setTimeout(function () {
-      if (done) return;
-      done = true;
-      onValue(null);
-    }, timeoutMs);
-
-    try {
-      getter(function (result) {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        if (result && result.status === Office.AsyncResultStatus.Succeeded) onValue(result.value);
-        else onValue(null);
-      });
-    } catch (e) {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      onValue(null);
-    }
-  }
-
-  function mapRecipsToObjects(arr) {
-    var out = [];
-    try {
-      for (var i = 0; i < (arr || []).length; i++) {
-        out.push({
-          emailAddress: arr[i].emailAddress || "",
-          displayName: arr[i].displayName || "",
-          recipientType: arr[i].recipientType || "user"
-        });
-      }
-    } catch (e) {}
-    return out;
-  }
-
-  function normalizeFromObj(v) {
-    if (!v) return { emailAddress: "", displayName: "" };
-    if (v.emailAddress || v.displayName) return { emailAddress: v.emailAddress || "", displayName: v.displayName || "" };
-    if (typeof v === "string") return { emailAddress: v, displayName: "" };
-    return { emailAddress: "", displayName: "" };
-  }
-
-  // =========================================================
-  // BODY NORMALIZATION: DOMParser -> tylko <body> (bez head i bez komentarzy)
-  // To naprawia: "Clean / DocumentEmail / false..." i poprawia spacje.
-  // =========================================================
-  function htmlToPlainTextBodyOnly(html) {
-    try {
-      var s = String(html || "");
-
-      // parse jako pełny dokument HTML
-      var doc = new DOMParser().parseFromString(s, "text/html");
-      if (!doc) return "";
-
-      // usuń style/script
-      var rm = doc.querySelectorAll("style,script");
-      for (var i = 0; i < rm.length; i++) rm[i].remove();
-
-      var body = doc.body;
-      var text = "";
-      if (body) {
-        // innerText lepiej zachowuje łamania linii niż textContent
-        text = body.innerText || body.textContent || "";
-      }
-
-      // NBSP -> space (to często jest "zjedzona spacja" między słowami)
-      text = text.replace(/[\u00A0\u2007\u202F]/g, " ");
-
-      // normalizacja whitespace, ale NIE usuwamy wszystkich spacji
-      text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-      text = text.replace(/[ \t]+/g, " ");
-      text = text.replace(/\n[ \t]+/g, "\n");
-      text = text.replace(/\n{3,}/g, "\n\n");
-
-      return text.trim();
-    } catch (e) {
-      return "";
-    }
-  }
-
-  // =========================================================
-  // Attachments: jak Forcepoint (jeśli API dostępne)
-  // =========================================================
-  function getAttachmentsLikeForcepoint(item, tx, cb) {
-    if (!item || typeof item.getAttachmentsAsync !== "function") {
-      cb([]);
+    return response.json().catch(() => null);
+  }).then(responseJson => {
+    if (!responseJson) {
+      printLog("Engine response is not JSON");
+      handleError("invalid_json", event);
       return;
     }
+    handleResponse(responseJson, event);
+  }).catch(e => {
+    printLog("Request crashed");
+    try { printLog(e.name); } catch (_) {}
+    handleError(e && e.name ? e.name : "request_crashed", event);
+  });
+}
 
-    getAsyncValue(function (done) { item.getAttachmentsAsync(done); }, CFG.attachmentsListTimeoutMs, function (attList) {
-      if (!attList || !attList.length) {
-        cb([]);
-        return;
-      }
+function handleResponse(data, event) {
+  printLog("Handling response from engine");
+  let message = Office.context.mailbox.item;
 
-      logD(tx, "Attachment list size: " + attList.length);
+  // Forcepoint semantics (as in your snippet):
+  // action === 1 -> BLOCK
+  // else -> ALLOW
+  if (data["action"] === 1) {
+    try {
+      message.notificationMessages.addAsync('NoSend', { type: 'errorMessage', message: 'Blocked by DLP engine' });
+    } catch (e) {}
+    printLog("DLP block");
+    try { event.completed({ allowEvent: false }); } catch (e2) {}
+  } else {
+    printLog("DLP allow");
+    try { event.completed({ allowEvent: true }); } catch (e3) {}
+  }
+}
 
-      if (typeof item.getAttachmentContentAsync !== "function") {
-        cb([]); // brak API do contentu w danym host/capability
-        return;
-      }
+async function tryPost(event, subject, from, to, cc, bcc, location, body, attachments) {
+  printLog("Trying to post");
+  let data = { subject, body, from, to, cc, bcc, location, attachments };
+  if (attachments) printLog("Attachment list size: " + attachments.length);
+  sendToClasifier(urlDseRoot + 'OutlookAddin', data, event);
+}
 
-      var results = [];
-      var pending = attList.length;
-      var finished = false;
+async function postMessage(message, event, subject, from, to, cc, bcc, location, body, attachments) {
+  printLog("Posting message");
 
-      function finish() {
-        if (finished) return;
-        finished = true;
-        cb(results.filter(Boolean));
-      }
+  // attachments can be null (no attachments) or AsyncResult from getAttachmentsAsync
+  if (attachments !== null && attachments && attachments.value && attachments.value.length > 0) {
+    await Promise.all(
+      attachments.value.map(attachment => new Promise((resolve) => {
+        // getAttachmentContentAsync exists only on some clients/requirements
+        if (typeof message.getAttachmentContentAsync !== "function") {
+          resolve(null);
+          return;
+        }
 
-      for (var i = 0; i < attList.length; i++) {
-        (function (att) {
-          var resolved = false;
+        let resolved = false;
 
-          var t = setTimeout(function () {
-            if (resolved) return;
-            resolved = true;
-            results.push(null);
-            pending--;
-            if (pending <= 0) finish();
-          }, CFG.attachmentContentTimeoutMs);
+        // per-attachment timeout (as Forcepoint)
+        const t = setTimeout(() => {
+          if (resolved) return;
+          resolved = true;
+          resolve(null);
+        }, 30000);
+
+        message.getAttachmentContentAsync(attachment.id, data => {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(t);
 
           try {
-            item.getAttachmentContentAsync(att.id, function (r) {
-              if (resolved) return;
-              resolved = true;
-              clearTimeout(t);
+            if (!data || data.status !== Office.AsyncResultStatus.Succeeded || !data.value) {
+              resolve(null);
+              return;
+            }
 
-              if (r && r.status === Office.AsyncResultStatus.Succeeded && r.value) {
-                var val = r.value;
-                var base64 = val.content;
+            let base64EncodedContent = data.value.content;
 
-                // UWAGA: btoa na binarnych/unicode potrafi wybuchnąć.
-                // Jeśli engine potrzebuje base64, a format != base64, to bezpieczniej i tak wysłać bez konwersji
-                // albo zrobić konwersję przez Uint8Array (cięższe). Tu trzymamy się prostego Forcepoint-like.
-                try {
-                  if (val.format !== "base64") {
-                    base64 = btoa(val.content);
-                    logD(tx, "Encoded attachment in base64");
-                  }
-                } catch (e0) {
-                  // fallback: pomiń ten załącznik, żeby nie wysypać flow
-                  results.push(null);
-                  pending--;
-                  if (pending <= 0) finish();
-                  return;
-                }
+            // Forcepoint: if not base64 -> btoa
+            if (data.value.format !== "base64") {
+              base64EncodedContent = btoa(data.value.content);
+              printLog("Encoded attachment in base64");
+            }
 
-                results.push({
-                  file_name: att.name,
-                  data: base64,
-                  content_type: att.contentType
-                });
-              } else {
-                results.push(null);
-              }
-
-              pending--;
-              if (pending <= 0) finish();
+            resolve({
+              file_name: attachment.name,
+              data: base64EncodedContent,
+              content_type: attachment.contentType
             });
           } catch (e) {
-            if (resolved) return;
-            resolved = true;
-            clearTimeout(t);
-            results.push(null);
-            pending--;
-            if (pending <= 0) finish();
+            resolve(null);
           }
-        })(attList[i]);
-      }
-
-      setTimeout(finish, CFG.attachmentContentTimeoutMs + 1000);
+        });
+      }))
+    ).then(result => {
+      tryPost(event, subject, from, to, cc, bcc, location, body, result.filter(Boolean));
     });
+  } else {
+    // no attachments
+    tryPost(event, subject, from, to, cc, bcc, location, body, []);
   }
+}
 
-  // =========================================================
-  // Collect payload (Message/Appointment)
-  // =========================================================
-  function collectPayload(item, tx, cb) {
-    var payload = {
-      subject: "",
-      body: "",
-      from: { emailAddress: "", displayName: "" },
-      to: [],
-      cc: [],
-      bcc: [],
-      location: "",
-      attachments: []
-    };
+function getIfVal(result) {
+  return result && result.status === Office.AsyncResultStatus.Succeeded ? result.value : "";
+}
 
-    function getBody(done) {
-      if (!item || !item.body || typeof item.body.getAsync !== "function") {
-        done("");
-        return;
-      }
+async function validate(event) {
+  const message = Office.context.mailbox.item;
 
-      getAsyncValue(
-        function (cb2) { item.body.getAsync(Office.CoercionType.Html, cb2); },
-        CFG.bodyTimeoutMs,
-        function (html) {
-          html = html || "";
-          if (CFG.debugLevel >= 3 && CFG.logBodyHtml) {
-            logD(tx, "=== Raw HTML Body ===");
-            logD(tx, truncateForLog(html));
-          }
+  if (message.itemType === "appointment") {
+    printLog("Validating appointment");
 
-          var plain = htmlToPlainTextBodyOnly(html);
+    await Promise.all([
+      new Promise((resolve, reject) => { httpServerCheck(resolve, reject); }),
 
-          if (CFG.debugLevel >= 3) {
-            logD(tx, "=== Normalized Text ===");
-            logD(tx, truncateForLog(plain));
-          }
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(""); }, 3000);
+        message.subject.getAsync(result => resolve(getIfVal(result)));
+      }),
 
-          done(plain);
-        }
-      );
-    }
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(""); }, 3000);
+        message.organizer.getAsync(result => resolve(getIfVal(result)));
+      }),
 
-    if (item.itemType === "message") {
-      logI(tx, "Validating message");
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(""); }, 3000);
+        message.requiredAttendees.getAsync(result => resolve(getIfVal(result)));
+      }),
 
-      getAsyncValue(function (cb2) { item.subject.getAsync(cb2); }, CFG.fieldTimeoutMs, function (subject) {
-        payload.subject = subject || "";
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(""); }, 3000);
+        message.optionalAttendees.getAsync(result => resolve(getIfVal(result)));
+      }),
 
-        var gotFrom = false;
-        if (item.from && typeof item.from.getAsync === "function") {
-          getAsyncValue(function (cb3) { item.from.getAsync(cb3); }, CFG.fieldTimeoutMs, function (fromVal) {
-            gotFrom = true;
-            payload.from = normalizeFromObj(fromVal);
-            afterFrom();
-          });
-        } else {
-          afterFrom();
-        }
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(""); }, 3000);
+        message.location.getAsync(result => resolve(getIfVal(result)));
+      }),
 
-        function afterFrom() {
-          if (!gotFrom) {
-            try {
-              var up = Office.context.mailbox.userProfile;
-              payload.from = { emailAddress: up.emailAddress || "", displayName: up.displayName || "" };
-            } catch (e0) {}
-          }
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(""); }, 5000);
+        message.body.getAsync(Office.CoercionType.Html, { asyncContext: event }, result => {
+          if (result.status === Office.AsyncResultStatus.Succeeded) {
+            const htmlBody = result.value;
 
-          getAsyncValue(function (cb4) { item.to.getAsync(cb4); }, CFG.fieldTimeoutMs, function (toVal) {
-            payload.to = mapRecipsToObjects(toVal || []);
+            printLog("=== Raw HTML Body ===");
+            printLog(htmlBody);
 
-            getAsyncValue(function (cb5) { item.cc.getAsync(cb5); }, CFG.fieldTimeoutMs, function (ccVal) {
-              payload.cc = mapRecipsToObjects(ccVal || []);
+            const plainText = normalizeHtmlToForcepointPlainText(htmlBody);
 
-              getAsyncValue(function (cb6) { item.bcc.getAsync(cb6); }, CFG.fieldTimeoutMs, function (bccVal) {
-                payload.bcc = mapRecipsToObjects(bccVal || []);
+            printLog("=== Normalized Text ===");
+            printLog(plainText);
 
-                getBody(function (bodyText) {
-                  payload.body = bodyText || "";
-
-                  getAttachmentsLikeForcepoint(item, tx, function (atts) {
-                    payload.attachments = atts || [];
-                    cb(payload);
-                  });
-                });
-              });
-            });
-          });
-        }
-      });
-
-      return;
-    }
-
-    if (item.itemType === "appointment") {
-      logI(tx, "Validating appointment");
-
-      getAsyncValue(function (cb2) { item.subject.getAsync(cb2); }, CFG.fieldTimeoutMs, function (subject) {
-        payload.subject = subject || "";
-
-        if (item.organizer && typeof item.organizer.getAsync === "function") {
-          getAsyncValue(function (cb3) { item.organizer.getAsync(cb3); }, CFG.fieldTimeoutMs, function (orgVal) {
-            payload.from = normalizeFromObj(orgVal);
-            afterOrg();
-          });
-        } else {
-          afterOrg();
-        }
-
-        function afterOrg() {
-          if (item.requiredAttendees && typeof item.requiredAttendees.getAsync === "function") {
-            getAsyncValue(function (cb4) { item.requiredAttendees.getAsync(cb4); }, CFG.fieldTimeoutMs, function (req) {
-              payload.to = mapRecipsToObjects(req || []);
-              afterReq();
-            });
+            resolve(plainText);
           } else {
-            afterReq();
+            resolve("");
           }
+        });
+      }),
 
-          function afterReq() {
-            if (item.optionalAttendees && typeof item.optionalAttendees.getAsync === "function") {
-              getAsyncValue(function (cb5) { item.optionalAttendees.getAsync(cb5); }, CFG.fieldTimeoutMs, function (opt) {
-                payload.cc = mapRecipsToObjects(opt || []);
-                afterOpt();
-              });
-            } else {
-              afterOpt();
-            }
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(null); }, 5000);
 
-            function afterOpt() {
-              if (item.location && typeof item.location.getAsync === "function") {
-                getAsyncValue(function (cb6) { item.location.getAsync(cb6); }, CFG.fieldTimeoutMs, function (loc) {
-                  payload.location = loc || "";
-                  afterLoc();
-                });
-              } else {
-                afterLoc();
-              }
-
-              function afterLoc() {
-                getBody(function (bodyText) {
-                  payload.body = bodyText || "";
-
-                  getAttachmentsLikeForcepoint(item, tx, function (atts) {
-                    payload.attachments = atts || [];
-                    cb(payload);
-                  });
-                });
-              }
-            }
-          }
+        // Forcepoint uses getAttachmentsAsync; keep identical shape
+        if (typeof message.getAttachmentsAsync !== "function") {
+          resolve(null);
+          return;
         }
-      });
 
-      return;
-    }
+        message.getAttachmentsAsync(result => {
+          if (result.status === Office.AsyncResultStatus.Succeeded && result.value && result.value.length > 0) {
+            resolve(result);
+            return;
+          }
+          resolve(null);
+        });
+      })
+    ]).then(([alive, subject, organizer, requiredAttendees, optionalAttendees, location, body, attachments]) => {
+      postMessage(message, event, subject, organizer, requiredAttendees, optionalAttendees, [], location, body, attachments);
+    }).catch(err => {
+      handleError("Server might be down", event);
+    });
 
-    logE(tx, "message item type unknown", { itemType: item.itemType });
-    cb(payload);
+  } else if (message.itemType === "message") {
+    printLog("Validating message");
+
+    await Promise.all([
+      new Promise((resolve, reject) => { httpServerCheck(resolve, reject); }),
+
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(""); }, 3000);
+        message.subject.getAsync(result => resolve(getIfVal(result)));
+      }),
+
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(""); }, 3000);
+        message.from.getAsync(result => resolve(getIfVal(result)));
+      }),
+
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(""); }, 3000);
+        message.to.getAsync(result => resolve(getIfVal(result)));
+      }),
+
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(""); }, 3000);
+        message.cc.getAsync(result => resolve(getIfVal(result)));
+      }),
+
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(""); }, 3000);
+        message.bcc.getAsync(result => resolve(getIfVal(result)));
+      }),
+
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(""); }, 5000);
+        message.body.getAsync(Office.CoercionType.Html, { asyncContext: event }, result => {
+          if (result.status === Office.AsyncResultStatus.Succeeded) {
+            const htmlBody = result.value;
+
+            printLog("=== Raw HTML Body ===");
+            printLog(htmlBody);
+
+            const plainText = normalizeHtmlToForcepointPlainText(htmlBody);
+
+            printLog("=== Normalized Text ===");
+            printLog(plainText);
+
+            resolve(plainText);
+          } else {
+            resolve("");
+          }
+        });
+      }),
+
+      new Promise((resolve) => {
+        setTimeout(() => { resolve(null); }, 5000);
+
+        if (typeof message.getAttachmentsAsync !== "function") {
+          resolve(null);
+          return;
+        }
+
+        message.getAttachmentsAsync(result => {
+          if (result.status === Office.AsyncResultStatus.Succeeded && result.value && result.value.length > 0) {
+            resolve(result);
+            return;
+          }
+          resolve(null);
+        });
+      })
+    ]).then(([alive, subject, from, to, cc, bcc, body, attachments]) => {
+      postMessage(message, event, subject, from, to, cc, bcc, "", body, attachments);
+    }).catch(err => {
+      try { printLog(err.message); } catch (e) {}
+      handleError("Server might be down", event);
+    });
+
+  } else {
+    printLog("message item type unknown");
+    printLog(message.itemType);
+    handleError("Unknown Message Type", event);
   }
+}
 
-  // =========================================================
-  // Complete-once
-  // =========================================================
-  function makeCompleteOnce(event) {
-    var done = false;
-    return function (allow, reason) {
-      if (done) return;
-      done = true;
-      try { event.completed({ allowEvent: !!allow }); } catch (e) {}
-    };
-  }
+function onMessageSendHandler(event) {
+  Office.onReady().then(function () {
+    printLog("FP email validation started - [v1.2]");
 
-  // =========================================================
-  // Forcepoint semantics: action==1 => BLOCK else ALLOW
-  // =========================================================
-  function handleResponse(obj, tx, finish) {
-    logI(tx, "Handling response from engine");
-
-    if (CFG.debugLevel >= 3) {
-      logD(tx, "Engine raw response (truncated)");
-      try { logD(tx, truncateForLog(JSON.stringify(obj))); } catch (e) {}
-    }
-
-    var actionVal = obj ? obj.action : null;
-    if (typeof actionVal === "string") actionVal = actionVal.trim();
-
-    var isBlock = (actionVal === 1 || actionVal === "1");
-
-    if (isBlock) {
-      notifyBlocked("Blocked by DLP engine");
-      logI(tx, "DLP block");
-      finish(false, "blocked");
+    var os = operatingSytem();
+    if (os === "MacOS") {
+      printLog("MacOS detected");
+      urlDseRoot = 'https://localhost:55296/';
+      validate(event).catch(err => { handleError(err, event); });
+    } else if (os === "WindowsOS") {
+      printLog("WindowsOS detected");
+      urlDseRoot = 'https://localhost:55299/';
+      validate(event).catch(err => { handleError(err, event); });
     } else {
-      logI(tx, "DLP allow");
-      finish(true, "allowed");
+      printLog("OS is not MacOS or WindowsOS");
+      handleError("Not MacOS or WindowsOS", event);
     }
-  }
+  });
+}
 
-  // =========================================================
-  // POST to classifier with retry when HTTP0/network
-  // 1st try: headers per CFG (default: none)
-  // retry: if fail and we had headers -> retry with NO headers
-  // =========================================================
-  function postToClassifier(tx, classifyUrl, payloadStr, cb) {
-    var headers = null;
-
-    if (CFG.postContentType && String(CFG.postContentType).trim()) {
-      headers = { "Content-Type": String(CFG.postContentType).trim() };
-    }
-
-    logD(tx, "Classifier POST", {
-      url: classifyUrl,
-      contentType: headers ? headers["Content-Type"] : "(none)",
-      bytes: payloadStr ? payloadStr.length : 0
-    });
-
-    xhr("POST", classifyUrl, payloadStr, CFG.classifyTimeoutMs, headers, function (err, respText) {
-      if (!err) { cb(null, respText); return; }
-
-      // retry only for network-ish errors, and only if first try had headers
-      var em = (err && err.message) ? err.message : "";
-      var isNet = /HTTP 0|network|abort|timeout/i.test(em);
-
-      if (isNet && headers) {
-        logE(tx, "classify failed (will retry without headers)", { err: em, url: classifyUrl });
-        xhr("POST", classifyUrl, payloadStr, CFG.classifyTimeoutMs, null, function (err2, respText2) {
-          cb(err2, respText2);
-        });
-        return;
-      }
-
-      cb(err, respText);
-    });
-  }
-
-  // =========================================================
-  // Main OnSend handler
-  // =========================================================
-  window.onMessageSendHandler = function onMessageSendHandler(event) {
-    var tx = "TX-" + Date.now() + "-" + Math.floor(Math.random() * 1000000);
-    var t0 = Date.now();
-    var complete = makeCompleteOnce(event);
-
-    function ms() { return Date.now() - t0; }
-
-    logI(tx, "FP email validation started - [v1.2]");
-    try { logI(tx, "WindowsOS detected"); } catch (e0) {}
-
-    notifyInfo("Checking DLP...");
-
-    var watchdog = setTimeout(function () {
-      logE(tx, "WATCHDOG fired", { ms: ms() });
-      notifyInfo("DLP timeout – allow (watchdog).");
-      complete(true, "watchdog");
-    }, CFG.hardTimeoutMs);
-
-    function finish(allow, reason) {
-      clearTimeout(watchdog);
-      logI(tx, "completed", { allow: allow, reason: reason, ms: ms() });
-      complete(allow, reason);
-    }
-
-    // 1) ping
-    logI(tx, "Checking the server");
-    var pingUrl = CFG.agentBase + CFG.pingPath;
-
-    xhr("GET", pingUrl, null, CFG.pingTimeoutMs, null, function (pingErr) {
-      if (pingErr) {
-        logE(tx, "Server might be down", { err: pingErr.message, url: pingUrl, ms: ms() });
-
-        if (CFG.failClosed) {
-          notifyBlocked("Blocked by DLP engine (server down)");
-          finish(false, "server_down_fail_closed");
-        } else {
-          finish(true, "server_down_fail_open");
-        }
-        return;
-      }
-
-      logI(tx, "Server is UP");
-
-      var item = Office.context.mailbox.item;
-      logI(tx, "Posting message");
-      logD(tx, "Trying to post");
-
-      collectPayload(item, tx, function (payloadObj) {
-        if (CFG.debugLevel >= 3) {
-          var preview = (payloadObj.body || "").slice(0, 220);
-          logD(tx, "Payload body preview", preview);
-        }
-
-        logD(tx, "Sending event to classifier");
-
-        var classifyUrl = CFG.agentBase + CFG.classifyPath;
-        var payloadStr = JSON.stringify(payloadObj);
-
-        postToClassifier(tx, classifyUrl, payloadStr, function (classErr, respText) {
-          if (classErr) {
-            logE(tx, "classify failed", { err: classErr.message, url: classifyUrl, ms: ms() });
-
-            if (CFG.failClosed) {
-              notifyBlocked("Blocked by DLP engine (classify error)");
-              finish(false, "classify_error_fail_closed");
-            } else {
-              finish(true, "classify_error_fail_open");
-            }
-            return;
-          }
-
-          var obj = safeJsonParse(respText || "");
-          if (!obj) {
-            if (CFG.debugLevel >= 3) {
-              logD(tx, "Engine raw response (string, truncated)");
-              logD(tx, truncateForLog(respText || ""));
-            }
-
-            logE(tx, "Engine response is not JSON");
-            if (CFG.failClosed) {
-              notifyBlocked("Blocked by DLP engine (invalid response)");
-              finish(false, "invalid_response_fail_closed");
-            } else {
-              finish(true, "invalid_response_fail_open");
-            }
-            return;
-          }
-
-          handleResponse(obj, tx, finish);
-        });
-      });
-    });
-  };
-
-  // keep runtime warm
-  try { Office.onReady(function () {}); } catch (e) {}
-
-})();
+// expose for manifest action mapping
+window.onMessageSendHandler = onMessageSendHandler;
