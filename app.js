@@ -7,7 +7,7 @@
     agentPort: 55299,
     agentBase: null,          // wyliczane z portu
     pingPath: "FirefoxExt/_1",
-    classifyPath: "EmailDataProcess/_1",
+    classifyPath: "OutlookAddin",
 
     // zachowanie przy błędzie
     failClosed: false,        // DEV: false = fail-open
