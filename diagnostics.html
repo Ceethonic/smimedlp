@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>DLP DEV Diagnostics</title>
+  <style>
+    body { font-family: Segoe UI, Arial, sans-serif; margin: 12px; }
+    label { display:block; margin-top:10px; }
+    textarea { width: 100%; height: 260px; }
+    button { margin-right: 8px; margin-top: 10px; }
+    .row { display:flex; gap:10px; align-items:center; }
+    .row > div { flex: 1; }
+    .hint { font-size: 12px; opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <h3>Forcepoint DLP DEV – Diagnostics</h3>
+
+  <div class="row">
+    <div>
+      <label>Debug level (0–3)</label>
+      <input id="dbgLevel" type="number" min="0" max="3" />
+    </div>
+    <div>
+      <label>Fail closed</label>
+      <select id="failClosed">
+        <option value="false">false (fail-open)</option>
+        <option value="true">true (fail-closed)</option>
+      </select>
+    </div>
+    <div>
+      <label>Agent port</label>
+      <input id="agentPort" type="number" />
+    </div>
+  </div>
+
+  <div class="row">
+    <div>
+      <label>Log sink URL (opcjonalnie)</label>
+      <input id="logSinkUrl" type="text" placeholder="https://localhost:55299/DevLog/_1" style="width:100%"/>
+      <div class="hint">Jeśli masz lokalny serwis, który zapisuje log do pliku.</div>
+    </div>
+  </div>
+
+  <button id="btnSave">Save config</button>
+  <button id="btnRefresh">Refresh logs</button>
+  <button id="btnCopy">Copy logs</button>
+  <button id="btnDownload">Download logs</button>
+  <button id="btnClear">Clear logs</button>
+
+  <p class="hint">
+    Uwaga: w Outlook Desktop część funkcji przeglądarkowych (np. download) może być ograniczona.
+    Jeśli download nie zadziała – użyj Copy logs albo runtime logging.
+  </p>
+
+  <label>Logs</label>
+  <textarea id="logs" readonly></textarea>
+
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script src="diagnostics.js"></script>
+</body>
+</html>
