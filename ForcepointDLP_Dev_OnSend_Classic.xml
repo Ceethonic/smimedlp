@@ -6,29 +6,31 @@
   xmlns:mailappor="http://schemas.microsoft.com/office/mailappversionoverrides"
   xsi:type="MailApp">
 
-  <!-- DEV: możesz dać osobny GUID, żeby nie kolidować z PROD -->
-  <Id>11111111-2222-3333-4444-555555555555</Id>
+  <!-- DEV: oddzielny GUID (żeby nie kolidować z produkcyjnym Forcepoint) -->
+  <Id>9F3B66B0-4E6A-4E5B-8C6F-2B8B469C1B7A</Id>
 
   <Version>1.0.0.0</Version>
-  <ProviderName>Forcepoint DLP (DEV)</ProviderName>
+  <ProviderName>smimedlp (DEV)</ProviderName>
   <DefaultLocale>pl-pl</DefaultLocale>
 
-  <DisplayName DefaultValue="Forcepoint DLP (DEV Classic OnSend)" />
-  <Description DefaultValue="DEV: Classic Outlook (outlook.exe) ItemSend + Diagnostics." />
+  <DisplayName DefaultValue="smimedlp (DEV Classic OnSend)" />
+  <Description DefaultValue="DEV: Classic Outlook (outlook.exe) ItemSend + Diagnostics (GitHub Pages)." />
 
-  <IconUrl DefaultValue="https://ADDIN_BASE_URL/icons/icon32.png" />
-  <HighResolutionIconUrl DefaultValue="https://ADDIN_BASE_URL/icons/icon80.png" />
-  <SupportUrl DefaultValue="https://ADDIN_BASE_URL/diagnostics.html" />
+  <!-- Ikony: dokładnie jak w oryginalnym Forcepoint -->
+  <IconUrl DefaultValue="https://cdn.websense.com/addins/DLPOfficeAddin/v25.09/icon.png" />
+  <HighResolutionIconUrl DefaultValue="https://cdn.websense.com/addins/DLPOfficeAddin/v25.09/icon.png" />
+
+  <SupportUrl DefaultValue="https://ceethonic.github.io/smimedlp/diagnostics.html" />
 
   <AppDomains>
-    <AppDomain>https://ADDIN_BASE_URL</AppDomain>
+    <AppDomain>https://ceethonic.github.io</AppDomain>
+    <AppDomain>https://cdn.websense.com</AppDomain>
   </AppDomains>
 
   <Hosts>
     <Host Name="Mailbox" />
   </Hosts>
 
-  <!-- Exchange 2019 on-prem: trzymaj się <= 1.5; on-send działa mimo że "oficjalnie" 1.8, bo support matrix jest szerszy. :contentReference[oaicite:2]{index=2} -->
   <Requirements>
     <Sets DefaultMinVersion="1.5">
       <Set Name="Mailbox" />
@@ -38,7 +40,7 @@
   <FormSettings>
     <Form xsi:type="ItemEdit">
       <DesktopSettings>
-        <SourceLocation DefaultValue="https://ADDIN_BASE_URL/index.html?env=dev" />
+        <SourceLocation DefaultValue="https://ceethonic.github.io/smimedlp/index.html" />
       </DesktopSettings>
     </Form>
   </FormSettings>
@@ -52,6 +54,7 @@
 
   <VersionOverrides xmlns="http://schemas.microsoft.com/office/mailappversionoverrides" xsi:type="VersionOverridesV1_0">
     <VersionOverrides xmlns="http://schemas.microsoft.com/office/mailappversionoverrides/1.1" xsi:type="VersionOverridesV1_1">
+
       <Requirements>
         <bt:Sets DefaultMinVersion="1.5">
           <bt:Set Name="Mailbox" />
@@ -72,7 +75,7 @@
                      FunctionName="onMessageSendHandler" />
             </ExtensionPoint>
 
-            <!-- 2) Panel diagnostyczny (przycisk w oknie tworzenia maila) -->
+            <!-- 2) Panel diagnostyczny (przycisk w compose) -->
             <ExtensionPoint xsi:type="MessageComposeCommandSurface">
               <OfficeTab id="TabDefault">
                 <Group id="grpDev">
@@ -84,6 +87,7 @@
                       <Description resid="residBtnDesc"/>
                     </Supertip>
                     <Icon>
+                      <!-- Jedna ikona, użyta dla wszystkich rozmiarów -->
                       <bt:Image size="16" resid="residIcon16"/>
                       <bt:Image size="32" resid="residIcon32"/>
                       <bt:Image size="80" resid="residIcon80"/>
@@ -102,23 +106,23 @@
 
       <Resources>
         <bt:Images>
-          <bt:Image id="residIcon16" DefaultValue="https://ADDIN_BASE_URL/icons/icon16.png"/>
-          <bt:Image id="residIcon32" DefaultValue="https://ADDIN_BASE_URL/icons/icon32.png"/>
-          <bt:Image id="residIcon80" DefaultValue="https://ADDIN_BASE_URL/icons/icon80.png"/>
+          <bt:Image id="residIcon16" DefaultValue="https://cdn.websense.com/addins/DLPOfficeAddin/v25.09/icon.png"/>
+          <bt:Image id="residIcon32" DefaultValue="https://cdn.websense.com/addins/DLPOfficeAddin/v25.09/icon.png"/>
+          <bt:Image id="residIcon80" DefaultValue="https://cdn.websense.com/addins/DLPOfficeAddin/v25.09/icon.png"/>
         </bt:Images>
 
         <bt:Urls>
-          <bt:Url id="residFunctionFileUrl" DefaultValue="https://ADDIN_BASE_URL/index.html?env=dev" />
-          <bt:Url id="residDiagnosticsUrl" DefaultValue="https://ADDIN_BASE_URL/diagnostics.html?env=dev" />
+          <bt:Url id="residFunctionFileUrl" DefaultValue="https://ceethonic.github.io/smimedlp/index.html" />
+          <bt:Url id="residDiagnosticsUrl" DefaultValue="https://ceethonic.github.io/smimedlp/diagnostics.html" />
         </bt:Urls>
 
         <bt:ShortStrings>
-          <bt:String id="residGroupLabel" DefaultValue="Forcepoint DEV"/>
+          <bt:String id="residGroupLabel" DefaultValue="smimedlp DEV"/>
           <bt:String id="residBtnLabel" DefaultValue="DLP Logs"/>
         </bt:ShortStrings>
 
         <bt:LongStrings>
-          <bt:String id="residBtnDesc" DefaultValue="Otwórz panel diagnostyczny i podgląd logów dodatku (DEV)."/>
+          <bt:String id="residBtnDesc" DefaultValue="Podgląd i eksport logów dodatku (DEV)."/>
         </bt:LongStrings>
       </Resources>
 
