@@ -2,35 +2,52 @@
 (function () {
   "use strict";
 
-  // ====== DEV KONFIG (możesz nadpisać w diagnostics pane) ======
+  // =========================================================
+  // DEV CONFIG (nadpisywana przez localStorage: DLP_DEV_CFG)
+  // =========================================================
   var CFG = {
+    // Agent (Forcepoint engine) na localhost
     agentPort: 55299,
-    agentBase: null,          // wyliczane z portu
+    agentBase: null,                 // wyliczane
+
+    // Endpointy zgodne z Forcepoint (olk.exe)
     pingPath: "FirefoxExt/_1",
     classifyPath: "OutlookAddin",
 
-    // zachowanie przy błędzie
-    failClosed: false,        // DEV: false = fail-open
+    // Fail policy
+    failClosed: false,               // DEV: false = fail-open
 
-    // timeouty (krótkie, żeby nie wieszać wysyłki)
-    hardTimeoutMs: 8000,      // watchdog całego on-send
-    pingTimeoutMs: 1200,
-    collectTimeoutMs: 2000,
-    classifyTimeoutMs: 3500,
+    // Timeouts (krótkie żeby nie wieszać send)
+    hardTimeoutMs: 12000,            // watchdog całego OnSend
+    pingTimeoutMs: 1500,
+    collectTimeoutMs: 4000,
+    classifyTimeoutMs: 7000,
 
-    // logowanie
-    debugLevel: 3,            // 0 OFF, 1 ERR, 2 INF, 3 DBG
+    // CORS/preflight workaround:
+    // - "application/json; charset=utf-8" (normalnie, ale generuje preflight OPTIONS)
+    // - "text/plain; charset=utf-8" (często bez preflight; serwer musi umieć parsować JSON z text/plain)
+    postContentType: "application/json; charset=utf-8",
+
+    // Logging
+    debugLevel: 3,                   // 0 OFF, 1 ERR, 2 INF, 3 DBG
     persistLocalStorage: true,
     localStorageKeyLogs: "DLP_DEV_LOGS",
-    localStorageKeyCfg:  "DLP_DEV_CFG",
+    localStorageKeyCfg: "DLP_DEV_CFG",
 
-    // opcjonalny “log sink” (jeśli masz lokalny serwis, który zapisze log do pliku)
-    // np. https://localhost:55299/DevLog/_1
-    logSinkUrl: ""
+    // log sink (opcjonalnie): endpoint, który zapisuje logi do pliku po stronie localhost
+    // np. https://localhost:55298/DevLog/_1
+    logSinkUrl: "",
+
+    // Kontrola logowania treści
+    logBodyHtml: true,               // loguj surowy HTML (DBG)
+    maxBodyLogChars: 6000            // limit na dump (żeby nie zabić konsoli)
   };
 
-  // ====== STORAGE CFG ======
+  // =========================================================
+  // Storage CFG
+  // =========================================================
   function safeJsonParse(s) { try { return JSON.parse(s); } catch (e) { return null; } }
+
   function loadCfg() {
     try {
       var raw = localStorage.getItem(CFG.localStorageKeyCfg);
@@ -39,6 +56,7 @@
       for (var k in obj) if (obj.hasOwnProperty(k) && CFG.hasOwnProperty(k)) CFG[k] = obj[k];
     } catch (e) {}
   }
+
   function saveCfg() {
     try { localStorage.setItem(CFG.localStorageKeyCfg, JSON.stringify(CFG)); } catch (e) {}
   }
@@ -46,37 +64,7 @@
   loadCfg();
   CFG.agentBase = "https://localhost:" + CFG.agentPort + "/";
 
-  // ====== LOGGING ======
-  var _buf = [];
-  function pushLog(level, tx, msg, data) {
-    var entry = { ts: new Date().toISOString(), lvl: level, tx: tx, msg: msg, data: data || null };
-    _buf.push(entry);
-    if (_buf.length > 600) _buf.shift();
-
-    if (CFG.persistLocalStorage) {
-      try { localStorage.setItem(CFG.localStorageKeyLogs, JSON.stringify(_buf)); } catch (e) {}
-    }
-
-    // console
-    try { console.log("[DLP][" + level + "][" + tx + "] " + msg, data || ""); } catch (e) {}
-
-    // opcjonalny sink
-    if (CFG.logSinkUrl) {
-      try {
-        var x = new XMLHttpRequest();
-        x.open("POST", CFG.logSinkUrl, true);
-        x.timeout = 300;
-        x.setRequestHeader("Content-Type", "application/json; charset=utf-8");
-        x.send(JSON.stringify(entry));
-      } catch (e2) {}
-    }
-  }
-  function logE(tx, msg, data) { if (CFG.debugLevel >= 1) pushLog("ERR", tx, msg, data); }
-  function logI(tx, msg, data) { if (CFG.debugLevel >= 2) pushLog("INF", tx, msg, data); }
-  function logD(tx, msg, data) { if (CFG.debugLevel >= 3) pushLog("DBG", tx, msg, data); }
-
-  // export dla diagnostyki (gdyby sandbox dzielił kontekst – bywa różnie)
-  window.DLP_DEV_DUMP = function () { try { return _buf.slice(); } catch (e) { return []; } };
+  // Exposed for diagnostics pane
   window.DLP_DEV_CFG_SAVE = function (newCfg) {
     if (!newCfg) return;
     for (var k in newCfg) if (newCfg.hasOwnProperty(k) && CFG.hasOwnProperty(k)) CFG[k] = newCfg[k];
@@ -84,7 +72,53 @@
     saveCfg();
   };
 
-  // ====== UI notify (krótko) ======
+  // =========================================================
+  // Logging (Forcepoint-like + TX)
+  // =========================================================
+  var _buf = [];
+
+  function nowIso() {
+    try { return new Date().toISOString(); } catch (e) { return "" + (new Date()); }
+  }
+
+  function pushLog(level, tx, msg, data) {
+    var entry = { ts: nowIso(), lvl: level, tx: tx, msg: msg, data: data || null };
+
+    _buf.push(entry);
+    if (_buf.length > 800) _buf.shift();
+
+    if (CFG.persistLocalStorage) {
+      try { localStorage.setItem(CFG.localStorageKeyLogs, JSON.stringify(_buf)); } catch (e) {}
+    }
+
+    // Console formatting similar-ish to your logs
+    try {
+      var line = entry.ts + " [" + level + "] [" + tx + "] " + msg;
+      if (data !== undefined && data !== null) console.log(line, data);
+      else console.log(line);
+    } catch (e2) {}
+
+    // Optional log sink (fire-and-forget)
+    if (CFG.logSinkUrl) {
+      try {
+        var x = new XMLHttpRequest();
+        x.open("POST", CFG.logSinkUrl, true);
+        x.timeout = 300;
+        x.setRequestHeader("Content-Type", "application/json; charset=utf-8");
+        x.send(JSON.stringify(entry));
+      } catch (e3) {}
+    }
+  }
+
+  function logE(tx, msg, data) { if (CFG.debugLevel >= 1) pushLog("ERR", tx, msg, data); }
+  function logI(tx, msg, data) { if (CFG.debugLevel >= 2) pushLog("INF", tx, msg, data); }
+  function logD(tx, msg, data) { if (CFG.debugLevel >= 3) pushLog("DBG", tx, msg, data); }
+
+  window.DLP_DEV_DUMP = function () { try { return _buf.slice(); } catch (e) { return []; } };
+
+  // =========================================================
+  // UI notifications (krótkie)
+  // =========================================================
   function notify(type, message) {
     try {
       var item = Office.context.mailbox.item;
@@ -97,44 +131,137 @@
     } catch (e) {}
   }
 
-  // ====== Helpers ======
-  function makeCompleteOnce(event) {
+  // =========================================================
+  // XHR helper - callback ONCE (fix dublowania HTTP0/network)
+  // =========================================================
+  function xhr(method, url, payload, timeoutMs, headers, cb) {
+    var x = new XMLHttpRequest();
     var done = false;
-    return function (allow, reason) {
+
+    function finish(err, text) {
       if (done) return;
       done = true;
-      try { event.completed({ allowEvent: !!allow }); } catch (e) {}
-    };
-  }
+      try {
+        x.onreadystatechange = null;
+        x.onerror = null;
+        x.ontimeout = null;
+        x.onabort = null;
+      } catch (e) {}
+      cb(err, text);
+    }
 
-  function xhr(method, url, payload, timeoutMs, cb) {
-    var x = new XMLHttpRequest();
-    x.open(method, url, true);
-    x.timeout = timeoutMs;
-    x.onreadystatechange = function () {
-      if (x.readyState !== 4) return;
-      if (x.status >= 200 && x.status < 300) cb(null, x.responseText || "");
-      else cb(new Error("HTTP " + x.status));
-    };
-    x.ontimeout = function () { cb(new Error("timeout")); };
-    x.onerror = function () { cb(new Error("network")); };
     try {
-      if (payload) {
-        x.setRequestHeader("Content-Type", "application/json; charset=utf-8");
-        x.send(JSON.stringify(payload));
+      x.open(method, url, true);
+      x.timeout = timeoutMs;
+
+      x.onreadystatechange = function () {
+        if (x.readyState !== 4) return;
+        if (x.status >= 200 && x.status < 300) finish(null, x.responseText || "");
+        else finish(new Error("HTTP " + x.status), null);
+      };
+
+      x.onerror = function () { finish(new Error("network"), null); };
+      x.ontimeout = function () { finish(new Error("timeout"), null); };
+      x.onabort = function () { finish(new Error("abort"), null); };
+
+      if (headers) {
+        for (var h in headers) if (headers.hasOwnProperty(h)) x.setRequestHeader(h, headers[h]);
+      }
+
+      if (payload !== undefined && payload !== null) {
+        x.send(payload);
       } else {
         x.send();
       }
     } catch (e) {
-      cb(e);
+      finish(e, null);
     }
   }
 
-  function collectItemData(maxWaitMs, cb) {
-    var item = Office.context.mailbox.item;
-    var data = { subject: "", bodyText: "", to: [], cc: [], bcc: [] };
+  // =========================================================
+  // HTML -> normalized text (DEV)
+  // =========================================================
+  function normalizeText(s) {
+    if (!s) return "";
+    // collapse whitespace + normalize newlines
+    return String(s)
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n\s*\n+/g, "\n\n")
+      .trim();
+  }
 
-    var pending = 5;
+  function htmlToText(html) {
+    try {
+      var div = document.createElement("div");
+      div.innerHTML = html;
+      var text = div.textContent || div.innerText || "";
+      return normalizeText(text);
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function truncateForLog(s) {
+    if (!s) return "";
+    var t = String(s);
+    if (t.length <= CFG.maxBodyLogChars) return t;
+    return t.slice(0, CFG.maxBodyLogChars) + "\n...[truncated]...";
+  }
+
+  // =========================================================
+  // Collect message data (Forcepoint-ish payload)
+  // =========================================================
+  function mapRecipsToObjects(arr) {
+    var out = [];
+    try {
+      for (var i = 0; i < (arr || []).length; i++) {
+        out.push({
+          emailAddress: arr[i].emailAddress || "",
+          displayName: arr[i].displayName || "",
+          recipientType: arr[i].recipientType || "user"
+        });
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  function mapAttachments(item) {
+    var list = [];
+    try {
+      var a = item.attachments || [];
+      for (var i = 0; i < a.length; i++) {
+        list.push({
+          id: a[i].id,
+          name: a[i].name,
+          contentType: a[i].contentType,
+          size: a[i].size,
+          isInline: a[i].isInline
+        });
+      }
+    } catch (e) {}
+    return list;
+  }
+
+  function collectItemData(item, tx, cb) {
+    var fromProfile = (Office.context.mailbox && Office.context.mailbox.userProfile) ? Office.context.mailbox.userProfile : null;
+
+    var data = {
+      subject: "",
+      body: "", // normalized text for classifier
+      from: {
+        emailAddress: (fromProfile && fromProfile.emailAddress) ? fromProfile.emailAddress : "",
+        displayName: (fromProfile && fromProfile.displayName) ? fromProfile.displayName : ""
+      },
+      to: [],
+      cc: [],
+      bcc: [],
+      attachments: [],
+      location: ""
+    };
+
+    var pending = 6;
     var done = false;
 
     function finish() {
@@ -142,7 +269,11 @@
       done = true;
       cb(data);
     }
-    var timer = setTimeout(finish, maxWaitMs);
+
+    var timer = setTimeout(function () {
+      logE(tx, "collect timeout (partial data)", { pending: pending });
+      finish();
+    }, CFG.collectTimeoutMs);
 
     function one() {
       pending--;
@@ -152,48 +283,131 @@
       }
     }
 
-    function mapRecips(arr) {
-      var out = [];
-      try {
-        for (var i = 0; i < (arr || []).length; i++) out.push(arr[i].emailAddress || arr[i].displayName || "");
-      } catch (e) {}
-      return out;
-    }
+    // subject
+    try {
+      item.subject.getAsync(function (r) {
+        if (r && r.status === Office.AsyncResultStatus.Succeeded) data.subject = r.value || "";
+        one();
+      });
+    } catch (e) { one(); }
 
-    try { item.subject.getAsync(function (r) { if (r && r.status === Office.AsyncResultStatus.Succeeded) data.subject = r.value || ""; one(); }); } catch (e) { one(); }
-    try { item.body.getAsync(Office.CoercionType.Text, function (r) { if (r && r.status === Office.AsyncResultStatus.Succeeded) data.bodyText = (r.value || ""); one(); }); } catch (e) { one(); }
-    try { item.to.getAsync(function (r) { if (r && r.status === Office.AsyncResultStatus.Succeeded) data.to = mapRecips(r.value); one(); }); } catch (e) { one(); }
-    try { item.cc.getAsync(function (r) { if (r && r.status === Office.AsyncResultStatus.Succeeded) data.cc = mapRecips(r.value); one(); }); } catch (e) { one(); }
-    try { item.bcc.getAsync(function (r) { if (r && r.status === Office.AsyncResultStatus.Succeeded) data.bcc = mapRecips(r.value); one(); }); } catch (e) { one(); }
+    // body HTML (for logs + normalization)
+    var gotHtml = false;
+    var htmlValue = "";
+
+    try {
+      item.body.getAsync(Office.CoercionType.Html, function (r) {
+        if (r && r.status === Office.AsyncResultStatus.Succeeded) {
+          gotHtml = true;
+          htmlValue = r.value || "";
+          if (CFG.debugLevel >= 3 && CFG.logBodyHtml) {
+            logD(tx, "=== Raw HTML Body ===");
+            logD(tx, truncateForLog(htmlValue));
+          }
+          var norm = htmlToText(htmlValue);
+          if (CFG.debugLevel >= 3) {
+            logD(tx, "=== Normalized Text ===");
+            logD(tx, truncateForLog(norm));
+          }
+          data.body = norm;
+        }
+        one();
+      });
+    } catch (e) { one(); }
+
+    // recipients
+    try {
+      item.to.getAsync(function (r) {
+        if (r && r.status === Office.AsyncResultStatus.Succeeded) data.to = mapRecipsToObjects(r.value);
+        one();
+      });
+    } catch (e) { one(); }
+
+    try {
+      item.cc.getAsync(function (r) {
+        if (r && r.status === Office.AsyncResultStatus.Succeeded) data.cc = mapRecipsToObjects(r.value);
+        one();
+      });
+    } catch (e) { one(); }
+
+    try {
+      item.bcc.getAsync(function (r) {
+        if (r && r.status === Office.AsyncResultStatus.Succeeded) data.bcc = mapRecipsToObjects(r.value);
+        one();
+      });
+    } catch (e) { one(); }
+
+    // attachments + location (sync-ish)
+    try {
+      data.attachments = mapAttachments(item);
+      try { logD(tx, "Attachment list size: " + data.attachments.length); } catch (e2) {}
+    } catch (e3) {}
+
+    // location (appointment)
+    try {
+      if (item.itemType === "appointment") {
+        // w praktyce często jest string; jeśli nie, zostaw ""
+        data.location = item.location || "";
+      }
+    } catch (e4) {}
+
+    one();
   }
 
-  // ====== ENTRYPOINT: ItemSend ======
+  // =========================================================
+  // Complete-once
+  // =========================================================
+  function makeCompleteOnce(event) {
+    var done = false;
+    return function (allow, reason) {
+      if (done) return;
+      done = true;
+      try { event.completed({ allowEvent: !!allow }); } catch (e) {}
+    };
+  }
+
+  // =========================================================
+  // Main OnSend handler (ItemSend - classic outlook.exe)
+  // =========================================================
   window.onMessageSendHandler = function onMessageSendHandler(event) {
     var tx = "TX-" + Date.now() + "-" + Math.floor(Math.random() * 1000000);
     var t0 = Date.now();
     var complete = makeCompleteOnce(event);
 
-    logI(tx, "OnSend start", { env: "classic", port: CFG.agentPort });
+    function ms() { return Date.now() - t0; }
+
+    // Forcepoint-like header logs
+    logI(tx, "FP email validation started - [v1.2]");
+    try {
+      var plat = Office.context && Office.context.diagnostics && Office.context.diagnostics.platform;
+      // classic Outlook on Windows typically "PC"
+      if (plat === "Mac") logI(tx, "MacOS detected");
+      else logI(tx, "WindowsOS detected");
+    } catch (e) {}
+
+    logI(tx, "Validating message");
     notify("informationalMessage", "DLP DEV: sprawdzanie...");
 
-    // watchdog: zawsze zwolnij event
+    // watchdog – never hang
     var watchdog = setTimeout(function () {
-      logE(tx, "WATCHDOG fired", { ms: Date.now() - t0 });
+      logE(tx, "WATCHDOG fired", { ms: ms() });
       notify("informationalMessage", "DLP DEV: timeout – wysyłka dozwolona (watchdog).");
       complete(true, "watchdog");
     }, CFG.hardTimeoutMs);
 
     function finish(allow, reason) {
       clearTimeout(watchdog);
-      logI(tx, "completed", { allow: allow, reason: reason, ms: Date.now() - t0 });
+      logI(tx, "completed", { allow: allow, reason: reason, ms: ms() });
       complete(allow, reason);
     }
 
-    // 1) ping lokalnego agenta
+    // 1) ping server
+    logI(tx, "Checking the server");
     var pingUrl = CFG.agentBase + CFG.pingPath;
-    xhr("GET", pingUrl, null, CFG.pingTimeoutMs, function (pingErr) {
+
+    xhr("GET", pingUrl, null, CFG.pingTimeoutMs, null, function (pingErr) {
       if (pingErr) {
-        logE(tx, "ping failed", { err: pingErr.message, url: pingUrl });
+        logE(tx, "Server is down", { err: pingErr.message, url: pingUrl, ms: ms() });
         if (CFG.failClosed) {
           notify("errorMessage", "DLP DEV: agent nieosiągalny – blokuję (fail-closed).");
           finish(false, "agent_unreachable");
@@ -204,17 +418,29 @@
         return;
       }
 
-      logD(tx, "ping ok", { ms: Date.now() - t0 });
+      logI(tx, "Server is UP");
 
-      // 2) pobierz dane (krótko)
-      collectItemData(CFG.collectTimeoutMs, function (data) {
-        logD(tx, "collect ok", { ms: Date.now() - t0, subjectLen: (data.subject || "").length });
+      // 2) collect data
+      logI(tx, "Posting message");
+      logD(tx, "Trying to post");
 
-        // 3) klasyfikacja
+      var item = Office.context.mailbox.item;
+
+      collectItemData(item, tx, function (payload) {
+        logD(tx, "Sending event to classifier");
+
+        // 3) send to classifier
         var classifyUrl = CFG.agentBase + CFG.classifyPath;
-        xhr("POST", classifyUrl, data, CFG.classifyTimeoutMs, function (classErr, respText) {
+
+        // payload as Forcepoint-ish JSON
+        var body = JSON.stringify(payload);
+        var headers = { "Content-Type": CFG.postContentType };
+
+        xhr("POST", classifyUrl, body, CFG.classifyTimeoutMs, headers, function (classErr, respText) {
           if (classErr) {
-            logE(tx, "classify failed", { err: classErr.message, url: classifyUrl });
+            // Status 0 / network usually means CORS/preflight blocked or TLS issue
+            logE(tx, "classify failed", { err: classErr.message, url: classifyUrl, ms: ms() });
+
             if (CFG.failClosed) {
               notify("errorMessage", "DLP DEV: błąd klasyfikacji – blokuję (fail-closed).");
               finish(false, "classify_error");
@@ -225,11 +451,16 @@
             return;
           }
 
+          // Handle response from engine
+          logI(tx, "Handling response from engine");
+
           var allow = true;
           var msg = "";
+
           try {
-            var obj = JSON.parse(respText || "{}");
-            allow = (obj.action === 1);  // jak w Forcepoint: action==1 => allow
+            var obj = safeJsonParse(respText || "{}") || {};
+            // Forcepoint convention: action==1 => allow
+            allow = (obj.action === 1);
             msg = obj.msg || "";
           } catch (e) {
             allow = !CFG.failClosed;
@@ -237,9 +468,11 @@
           }
 
           if (allow) {
+            logI(tx, "DLP allow.");
             notify("informationalMessage", "DLP DEV: OK – wysyłka dozwolona.");
             finish(true, "allowed");
           } else {
+            logI(tx, "DLP block.", { msg: msg });
             notify("errorMessage", msg ? ("DLP DEV: Zablokowano: " + msg) : "DLP DEV: Zablokowano.");
             finish(false, "blocked");
           }
@@ -248,10 +481,7 @@
     });
   };
 
-  try {
-    Office.onReady(function () {
-      // nic – ale zostawiamy, żeby Office.js się ustabilizował
-    });
-  } catch (e) {}
+  // Keep runtime warm
+  try { Office.onReady(function () {}); } catch (e) {}
 
 })();
