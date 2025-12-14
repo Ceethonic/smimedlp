@@ -1,6 +1,6 @@
 // Copyright © 2025 Forcepoint LLC. All rights reserved.
 
-let logEnable = true;
+let logEnable = false;
 let urlDseRoot = 'https://localhost:55296/';
 
 function sleep(delay) {
