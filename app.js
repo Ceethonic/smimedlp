@@ -1,31 +1,24 @@
 /* global Office */
 
-/**
- * appvprem.js - Forcepoint-like (on-prem) for classic Outlook (outlook.exe)
- * Based on uploaded Forcepoint app.js logic (olk.exe), adapted for outlook.exe runtime stability.
- *
- * Key behaviors preserved:
- * - Ping: GET https://localhost:<port>/FirefoxExt/_1
- * - Classify: POST https://localhost:<port>/OutlookAddin with JSON payload
- * - Decision: if action === 1 => BLOCK, else => ALLOW
- * - Confirm popup is handled by native agent; add-in waits for response (heartbeat logs)
- *
- * Dev toggles:
- * - localStorage DLP_DEV_LOG_ENABLE="1" -> also shows progressIndicator (throttled)
- * - localStorage DLP_DEV_NO_CONTENT_TYPE="1" -> omit Content-Type header to reduce preflight issues
- */
+// Forcepoint-like DEV implementation for classic Outlook (outlook.exe)
+// - body normalization matches Forcepoint (strip tags only, keep entities like &nbsp;)
+// - extracts <body> and removes MSO conditional comments to avoid "Clean/DocumentEmail/false..." noise
+// - attachments: getAttachmentsAsync + getAttachmentContentAsync => {file_name,data,content_type}
+// - response semantics: action === 1 => BLOCK else ALLOW
+// - restored logs + "waiting for decision" heartbeat during confirm (agent popup)
 
-let logEnable = true;
+let logEnable = false;
 
-// Default ports as in Forcepoint behavior
+// Forcepoint ports (as in original):
 // - Windows: 55299
-// - Mac: 55296
-let urlDseRoot = "https://localhost:55299/";
+// - Mac:     55296
+let urlDseRoot = 'https://localhost:55299/';
 
-// Optional compat: omit Content-Type to avoid preflight/CORS issues in some classic Outlook setups
+// Optional compat toggle for CORS/preflight in classic Outlook:
+// set localStorage: DLP_DEV_NO_CONTENT_TYPE="1" to omit Content-Type header
 let compatNoContentType = false;
 
-// Throttle UI progressIndicator updates
+// Throttle UI progressIndicator updates (avoid UI hangs)
 let _lastUiLogTs = 0;
 
 (function loadDevToggles() {
@@ -41,53 +34,46 @@ function printLog(text) {
   const line = `[${new Date().toISOString()}] ${text}`;
   try { console.log(line); } catch (e) {}
 
-  // Optional: show in Outlook UI (non-blocking, throttled)
-  if (logEnable && (typeof text === "string" || text instanceof String)) {
+  // Optional: show in Outlook UI without blocking (NO sleep)
+  if (logEnable && (typeof text === 'string' || text instanceof String)) {
     const now = Date.now();
     if (now - _lastUiLogTs > 500) {
       _lastUiLogTs = now;
       try {
         Office.context.mailbox.item.notificationMessages.replaceAsync("succeeded", {
           type: "progressIndicator",
-          message: String(text).substring(0, Math.min(String(text).length, 250)),
+          message: text.substring(0, Math.min(text.length, 250)),
         });
-      } catch (e2) {}
+      } catch (e) {}
     }
   }
 }
 
 function handleError(data, event) {
-  try { printLog(String(data)); } catch (e) {}
+  printLog(String(data));
   printLog("Completing event (fail-open)");
-  try { event.completed({ allowEvent: true }); } catch (e2) {}
+  try { event.completed({ allowEvent: true }); } catch (e) {}
   printLog("Event Completed");
 }
 
 function operatingSytem() {
-  // In classic Outlook it's typically "PC" (Windows) or "Mac"
   try {
-    const platform = Office.context.diagnostics.platform;
-    if (platform === "Mac") return "MacOS";
-    if (platform === "PC" || platform === "OfficeOnline") return "WindowsOS";
-    return "Other";
+    var platform = Office.context.diagnostics.platform;
+    if (platform === 'Mac') return 'MacOS';
+    if (platform === 'OfficeOnline' || platform === 'PC') return 'WindowsOS';
+    return 'Other';
   } catch (e) {
-    return "Other";
+    return 'Other';
   }
 }
 
-/**
- * Outlook.exe sometimes returns full Word HTML doc including <head> and MSO conditional XML comments.
- * Forcepoint original does: html.replace(/<[^>]+>/g,'') which can leak junk text.
- * Fix: remove <head>, remove MSO conditional comments, try to extract <body>, then do same strip-tags.
- * IMPORTANT: We keep entities like &nbsp; literally (do NOT decode), matching Forcepoint behavior.
- */
+// --- HTML normalization exactly "Forcepoint-like" output ---
+// Keep entities like &nbsp; literally (do not decode), strip tags only.
+// But first remove head + MSO conditional comments + extract body.
 function extractBodyAndCleanMso(html) {
   let s = String(html || "");
-  // drop head content
   s = s.replace(/<head[\s\S]*?<\/head>/gi, "");
-  // drop MSO conditional comments (contain <xml> blocks that become "Clean/DocumentEmail/false...")
   s = s.replace(/<!--\s*\[if[\s\S]*?<!\s*\[endif\]\s*-->/gi, "");
-  // extract body if present
   const m = s.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
   if (m && m[1] !== undefined) return m[1];
   return s;
@@ -95,52 +81,49 @@ function extractBodyAndCleanMso(html) {
 
 function normalizeHtmlToForcepointPlainText(htmlBody) {
   const cleaned = extractBodyAndCleanMso(htmlBody);
-  return cleaned.replace(/<[^>]+>/g, "");
+  return cleaned.replace(/<[^>]+>/g, '');
 }
 
-// fetch with AbortController timeout
+// --- Network helpers (Forcepoint-style: fetch + AbortController timeouts) ---
 function fetchWithTimeout(url, options, timeoutMs) {
-  if (typeof AbortController === "undefined") return fetch(url, options);
-
+  if (typeof AbortController === "undefined") {
+    return fetch(url, options);
+  }
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   options = options || {};
   options.signal = controller.signal;
-
-  return fetch(url, options).finally(() => clearTimeout(t));
+  return fetch(url, options).finally(() => clearTimeout(timeout));
 }
 
 async function httpServerCheck(resolve, reject) {
   printLog("Checking the server");
 
-  fetchWithTimeout(urlDseRoot + "FirefoxExt/_1", {
-    method: "GET",
-    mode: "cors",
-    cache: "no-cache",
-    credentials: "same-origin",
-    redirect: "follow",
-    referrerPolicy: "no-referrer",
-  }, 30000)
-    .then((response) => {
-      if (!response.ok) {
-        printLog("Server is down");
-        reject(false);
-      } else {
-        printLog("Server is UP");
-        resolve(true);
-      }
-    })
-    .catch(() => {
-      printLog("Request crashed");
+  fetchWithTimeout(urlDseRoot + 'FirefoxExt/_1', {
+    method: 'GET',
+    mode: 'cors',
+    cache: 'no-cache',
+    credentials: 'same-origin',
+    redirect: 'follow',
+    referrerPolicy: 'no-referrer',
+  }, 30000).then(response => {
+    if (!response.ok) {
+      printLog("Server is down");
       reject(false);
-    });
+    } else {
+      printLog("Server is UP");
+      resolve(true);
+    }
+  }).catch(e => {
+    printLog("Request crashed");
+    reject(false);
+  });
 }
 
-async function sendToClasifier(url = "", data = {}, event) {
+async function sendToClasifier(url = '', data = {}, event) {
   printLog("Sending event to classifier");
 
-  // Heartbeat while agent confirm UI is active / request is pending
+  // If agent shows confirm popup, request may hang: show heartbeat logs
   let waitInterval = null;
   const waitStart = setTimeout(() => {
     waitInterval = setInterval(() => {
@@ -149,67 +132,61 @@ async function sendToClasifier(url = "", data = {}, event) {
   }, 1500);
 
   const headers = {};
-  if (!compatNoContentType) headers["Content-Type"] = "application/json";
+  if (!compatNoContentType) headers['Content-Type'] = 'application/json';
 
   fetchWithTimeout(url, {
-    method: "POST",
-    mode: "cors",
-    cache: "no-cache",
-    credentials: "same-origin",
+    method: 'POST',
+    mode: 'cors',
+    cache: 'no-cache',
+    credentials: 'same-origin',
     headers: headers,
-    redirect: "follow",
-    referrerPolicy: "no-referrer",
-    body: JSON.stringify(data),
-  }, 60000) // allow confirm flows; host-level timeout still applies
-    .then(async (response) => {
-      printLog("Classifier HTTP status: " + response.status);
+    redirect: 'follow',
+    referrerPolicy: 'no-referrer',
+    body: JSON.stringify(data)
+  }, 35000).then(async (response) => {
+    printLog("Classifier HTTP status: " + response.status);
 
-      const raw = await response.text().catch(() => "");
-      printLog("Engine raw response: " + raw);
+    // RAW response for debugging real statuses (permit/confirm/block)
+    const raw = await response.text().catch(() => "");
+    printLog("Engine raw response: " + raw);
 
-      if (!response.ok) {
-        printLog("Engine returned error: " + response.status);
-        handleError("HTTP_" + response.status, event);
-        return null;
-      }
+    if (!response.ok) {
+      printLog("Engine returned error: " + response.status);
+      handleError(response.status, event);
+      return null;
+    }
 
-      try { return JSON.parse(raw); } catch (e) { return null; }
-    })
-    .then((respJson) => {
-      clearTimeout(waitStart);
-      if (waitInterval) clearInterval(waitInterval);
+    try { return JSON.parse(raw); } catch (e) { return null; }
+  }).then((responseJson) => {
+    clearTimeout(waitStart);
+    if (waitInterval) clearInterval(waitInterval);
 
-      if (!respJson) {
-        printLog("Engine response is not JSON");
-        handleError("invalid_json", event);
-        return;
-      }
+    if (!responseJson) {
+      printLog("Engine response is not JSON");
+      handleError("invalid_json", event);
+      return;
+    }
+    handleResponse(responseJson, event);
+  }).catch(e => {
+    clearTimeout(waitStart);
+    if (waitInterval) clearInterval(waitInterval);
 
-      handleResponse(respJson, event);
-    })
-    .catch((e) => {
-      clearTimeout(waitStart);
-      if (waitInterval) clearInterval(waitInterval);
-
-      printLog("Request crashed");
-      try { printLog(e && e.name ? e.name : "unknown_error"); } catch (_) {}
-      handleError(e && e.name ? e.name : "request_crashed", event);
-    });
+    printLog("Request crashed");
+    try { printLog(e && e.name ? e.name : "unknown_error"); } catch (_) {}
+    handleError(e && e.name ? e.name : "request_crashed", event);
+  });
 }
 
 function handleResponse(data, event) {
   printLog("Handling response from engine");
-  const message = Office.context.mailbox.item;
+  let message = Office.context.mailbox.item;
 
-  // Forcepoint semantics (from attachment):
-  // action === 1 => BLOCK
-  // else => ALLOW
+  // Forcepoint semantics (as you showed):
+  // action === 1 -> BLOCK
+  // else -> ALLOW
   if (data["action"] === 1) {
     try {
-      message.notificationMessages.addAsync("NoSend", {
-        type: "errorMessage",
-        message: "Blocked by DLP engine",
-      });
+      message.notificationMessages.addAsync('NoSend', { type: 'errorMessage', message: 'Blocked by DLP engine' });
     } catch (e) {}
     printLog("DLP block");
     try { event.completed({ allowEvent: false }); } catch (e2) {}
@@ -221,65 +198,60 @@ function handleResponse(data, event) {
 
 async function tryPost(event, subject, from, to, cc, bcc, location, body, attachments) {
   printLog("Trying to post");
-  const data = { subject, body, from, to, cc, bcc, location, attachments };
+  let data = { subject, body, from, to, cc, bcc, location, attachments };
   if (attachments) printLog("Attachment list size: " + attachments.length);
-  sendToClasifier(urlDseRoot + "OutlookAddin", data, event);
+  sendToClasifier(urlDseRoot + 'OutlookAddin', data, event);
 }
 
 async function postMessage(message, event, subject, from, to, cc, bcc, location, body, attachments) {
   printLog("Posting message");
 
-  // attachments: AsyncResult from getAttachmentsAsync OR null
+  // attachments can be null (no attachments) or AsyncResult from getAttachmentsAsync
   if (attachments !== null && attachments && attachments.value && attachments.value.length > 0) {
-    // If host doesn't support getAttachmentContentAsync, fail gracefully (send no attachments)
-    if (typeof message.getAttachmentContentAsync !== "function") {
-      tryPost(event, subject, from, to, cc, bcc, location, body, []);
-      return;
-    }
-
     await Promise.all(
-      attachments.value.map(
-        (attachment) =>
-          new Promise((resolve) => {
-            let resolved = false;
+      attachments.value.map(attachment => new Promise((resolve) => {
+        if (typeof message.getAttachmentContentAsync !== "function") {
+          resolve(null);
+          return;
+        }
 
-            // Forcepoint-style per attachment timeout
-            const t = setTimeout(() => {
-              if (resolved) return;
-              resolved = true;
+        let resolved = false;
+
+        const t = setTimeout(() => {
+          if (resolved) return;
+          resolved = true;
+          resolve(null);
+        }, 30000);
+
+        message.getAttachmentContentAsync(attachment.id, data => {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(t);
+
+          try {
+            if (!data || data.status !== Office.AsyncResultStatus.Succeeded || !data.value) {
               resolve(null);
-            }, 30000);
+              return;
+            }
 
-            message.getAttachmentContentAsync(attachment.id, (data) => {
-              if (resolved) return;
-              resolved = true;
-              clearTimeout(t);
+            let base64EncodedContent = data.value.content;
 
-              try {
-                if (!data || data.status !== Office.AsyncResultStatus.Succeeded || !data.value) {
-                  resolve(null);
-                  return;
-                }
+            if (data.value.format !== "base64") {
+              base64EncodedContent = btoa(data.value.content);
+              printLog("Encoded attachment in base64");
+            }
 
-                let base64EncodedContent = data.value.content;
-
-                if (data.value.format !== "base64") {
-                  base64EncodedContent = btoa(data.value.content);
-                  printLog("Encoded attachment in base64");
-                }
-
-                resolve({
-                  file_name: attachment.name,
-                  data: base64EncodedContent,
-                  content_type: attachment.contentType,
-                });
-              } catch (e) {
-                resolve(null);
-              }
+            resolve({
+              file_name: attachment.name,
+              data: base64EncodedContent,
+              content_type: attachment.contentType
             });
-          })
-      )
-    ).then((result) => {
+          } catch (e) {
+            resolve(null);
+          }
+        });
+      }))
+    ).then(result => {
       tryPost(event, subject, from, to, cc, bcc, location, body, result.filter(Boolean));
     });
   } else {
@@ -301,33 +273,33 @@ async function validate(event) {
       new Promise((resolve, reject) => { httpServerCheck(resolve, reject); }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(""), 3000);
-        message.subject.getAsync((result) => resolve(getIfVal(result)));
+        setTimeout(() => { resolve(""); }, 3000);
+        message.subject.getAsync(result => resolve(getIfVal(result)));
       }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(""), 3000);
-        message.organizer.getAsync((result) => resolve(getIfVal(result)));
+        setTimeout(() => { resolve(""); }, 3000);
+        message.organizer.getAsync(result => resolve(getIfVal(result)));
       }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(""), 3000);
-        message.requiredAttendees.getAsync((result) => resolve(getIfVal(result)));
+        setTimeout(() => { resolve(""); }, 3000);
+        message.requiredAttendees.getAsync(result => resolve(getIfVal(result)));
       }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(""), 3000);
-        message.optionalAttendees.getAsync((result) => resolve(getIfVal(result)));
+        setTimeout(() => { resolve(""); }, 3000);
+        message.optionalAttendees.getAsync(result => resolve(getIfVal(result)));
       }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(""), 3000);
-        message.location.getAsync((result) => resolve(getIfVal(result)));
+        setTimeout(() => { resolve(""); }, 3000);
+        message.location.getAsync(result => resolve(getIfVal(result)));
       }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(""), 5000);
-        message.body.getAsync(Office.CoercionType.Html, { asyncContext: event }, (result) => {
+        setTimeout(() => { resolve(""); }, 5000);
+        message.body.getAsync(Office.CoercionType.Html, { asyncContext: event }, result => {
           if (result.status === Office.AsyncResultStatus.Succeeded) {
             const htmlBody = result.value;
 
@@ -347,26 +319,26 @@ async function validate(event) {
       }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(null), 5000);
+        setTimeout(() => { resolve(null); }, 5000);
+
         if (typeof message.getAttachmentsAsync !== "function") {
           resolve(null);
           return;
         }
-        message.getAttachmentsAsync((result) => {
+
+        message.getAttachmentsAsync(result => {
           if (result.status === Office.AsyncResultStatus.Succeeded && result.value && result.value.length > 0) {
             resolve(result);
             return;
           }
           resolve(null);
         });
-      }),
-    ])
-      .then(([alive, subject, organizer, requiredAttendees, optionalAttendees, location, body, attachments]) => {
-        postMessage(message, event, subject, organizer, requiredAttendees, optionalAttendees, [], location, body, attachments);
       })
-      .catch(() => {
-        handleError("Server might be down", event);
-      });
+    ]).then(([alive, subject, organizer, requiredAttendees, optionalAttendees, location, body, attachments]) => {
+      postMessage(message, event, subject, organizer, requiredAttendees, optionalAttendees, [], location, body, attachments);
+    }).catch(err => {
+      handleError("Server might be down", event);
+    });
 
   } else if (message.itemType === "message") {
     printLog("Validating message");
@@ -375,33 +347,33 @@ async function validate(event) {
       new Promise((resolve, reject) => { httpServerCheck(resolve, reject); }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(""), 3000);
-        message.subject.getAsync((result) => resolve(getIfVal(result)));
+        setTimeout(() => { resolve(""); }, 3000);
+        message.subject.getAsync(result => resolve(getIfVal(result)));
       }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(""), 3000);
-        message.from.getAsync((result) => resolve(getIfVal(result)));
+        setTimeout(() => { resolve(""); }, 3000);
+        message.from.getAsync(result => resolve(getIfVal(result)));
       }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(""), 3000);
-        message.to.getAsync((result) => resolve(getIfVal(result)));
+        setTimeout(() => { resolve(""); }, 3000);
+        message.to.getAsync(result => resolve(getIfVal(result)));
       }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(""), 3000);
-        message.cc.getAsync((result) => resolve(getIfVal(result)));
+        setTimeout(() => { resolve(""); }, 3000);
+        message.cc.getAsync(result => resolve(getIfVal(result)));
       }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(""), 3000);
-        message.bcc.getAsync((result) => resolve(getIfVal(result)));
+        setTimeout(() => { resolve(""); }, 3000);
+        message.bcc.getAsync(result => resolve(getIfVal(result)));
       }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(""), 5000);
-        message.body.getAsync(Office.CoercionType.Html, { asyncContext: event }, (result) => {
+        setTimeout(() => { resolve(""); }, 5000);
+        message.body.getAsync(Office.CoercionType.Html, { asyncContext: event }, result => {
           if (result.status === Office.AsyncResultStatus.Succeeded) {
             const htmlBody = result.value;
 
@@ -421,63 +393,54 @@ async function validate(event) {
       }),
 
       new Promise((resolve) => {
-        setTimeout(() => resolve(null), 5000);
+        setTimeout(() => { resolve(null); }, 5000);
+
         if (typeof message.getAttachmentsAsync !== "function") {
           resolve(null);
           return;
         }
-        message.getAttachmentsAsync((result) => {
+
+        message.getAttachmentsAsync(result => {
           if (result.status === Office.AsyncResultStatus.Succeeded && result.value && result.value.length > 0) {
             resolve(result);
             return;
           }
           resolve(null);
         });
-      }),
-    ])
-      .then(([alive, subject, from, to, cc, bcc, body, attachments]) => {
-        postMessage(message, event, subject, from, to, cc, bcc, "", body, attachments);
       })
-      .catch((err) => {
-        try { printLog(err && err.message ? err.message : "validate_error"); } catch (e) {}
-        handleError("Server might be down", event);
-      });
+    ]).then(([alive, subject, from, to, cc, bcc, body, attachments]) => {
+      postMessage(message, event, subject, from, to, cc, bcc, "", body, attachments);
+    }).catch(err => {
+      try { printLog(err.message); } catch (e) {}
+      handleError("Server might be down", event);
+    });
 
   } else {
     printLog("message item type unknown");
-    try { printLog(message.itemType); } catch (e) {}
+    printLog(message.itemType);
     handleError("Unknown Message Type", event);
   }
 }
 
 function onMessageSendHandler(event) {
-  // Avoid long Office.onReady waits inside send event (but keep safe fallback)
-  function start() {
+  Office.onReady().then(function () {
     printLog("FP email validation started - [v1.2]");
 
-    const os = operatingSytem();
+    var os = operatingSytem();
     if (os === "MacOS") {
       printLog("MacOS detected");
-      urlDseRoot = "https://localhost:55296/";
-      validate(event).catch((err) => handleError(err, event));
+      urlDseRoot = 'https://localhost:55296/';
+      validate(event).catch(err => { handleError(err, event); });
     } else if (os === "WindowsOS") {
       printLog("WindowsOS detected");
-      urlDseRoot = "https://localhost:55299/";
-      validate(event).catch((err) => handleError(err, event));
+      urlDseRoot = 'https://localhost:55299/';
+      validate(event).catch(err => { handleError(err, event); });
     } else {
       printLog("OS is not MacOS or WindowsOS");
       handleError("Not MacOS or WindowsOS", event);
     }
-  }
-
-  try {
-    if (Office && Office.context && Office.context.mailbox) start();
-    else Office.onReady().then(start);
-  } catch (e) {
-    // last resort
-    start();
-  }
+  });
 }
 
-// Expose for manifest action mapping
+// expose for manifest action mapping
 window.onMessageSendHandler = onMessageSendHandler;
