@@ -12,35 +12,30 @@
     pingPath: "FirefoxExt/_1",
     classifyPath: "OutlookAddin",
 
-    // przy błędach sieci/parsowania:
     // false = fail-open, true = fail-closed
     failClosed: false,
 
     // timeouty
-    hardTimeoutMs: 12000,
+    hardTimeoutMs: 15000,
     pingTimeoutMs: 1500,
-    // per-field timeouts (jak w olk.exe)
     fieldTimeoutMs: 3000,
-    bodyTimeoutMs: 5000,
+    bodyTimeoutMs: 6000,
     attachmentsListTimeoutMs: 5000,
     attachmentContentTimeoutMs: 30000,
-    classifyTimeoutMs: 7000,
+    classifyTimeoutMs: 12000,
 
-    // content-type POST (CORS/preflight)
-    // application/json; charset=utf-8  -> zwykle preflight
-    // text/plain; charset=utf-8        -> często bez preflight (serwer musi przyjąć)
-    postContentType: "application/json; charset=utf-8",
+    // KLUCZOWE: domyślnie NIE ustawiamy Content-Type (jak często działa u Forcepoint)
+    // Ustaw tylko gdy musisz, np.:
+    // "application/json; charset=utf-8" albo "text/plain; charset=utf-8"
+    postContentType: "",
 
-    // logging
     debugLevel: 3, // 0 OFF, 1 ERR, 2 INF, 3 DBG
     persistLocalStorage: true,
     localStorageKeyLogs: "DLP_DEV_LOGS",
     localStorageKeyCfg: "DLP_DEV_CFG",
 
-    // opcjonalny log sink na localhost (zapis do pliku)
     logSinkUrl: "",
 
-    // log body
     logBodyHtml: true,
     maxBodyLogChars: 6000
   };
@@ -192,51 +187,7 @@
   }
 
   // =========================================================
-  // HTML -> plain text (bardziej jak olk.exe + fix spacji)
-  // =========================================================
-  function decodeHtmlEntities(s) {
-    try {
-      // szybki decode: &nbsp; &lt; itd.
-      var ta = document.createElement("textarea");
-      ta.innerHTML = s;
-      return ta.value;
-    } catch (e) {
-      return s;
-    }
-  }
-
-  function htmlToPlainTextForcepointLike(html) {
-    var s = String(html || "");
-
-    // log raw
-    // (logowanie robimy wyżej, tutaj tylko transformacja)
-
-    // usuń style/script (żeby nie wpychać CSS do body)
-    s = s.replace(/<style[\s\S]*?<\/style>/gi, " ");
-    s = s.replace(/<script[\s\S]*?<\/script>/gi, " ");
-
-    // zachowaj separatory zanim wytniesz tagi (żeby słowa się nie sklejały)
-    s = s.replace(/<br\s*\/?>/gi, "\n");
-    s = s.replace(/<\/(p|div|tr|td|th|li|h[1-6])>/gi, "\n");
-
-    // strip tagów jak w olk.exe (ale po powyższych separatorach)
-    s = s.replace(/<[^>]+>/g, "");
-
-    // decode encji + NBSP -> normal space
-    s = decodeHtmlEntities(s);
-    s = s.replace(/[\u00A0\u2007\u202F]/g, " "); // NBSP/NNBSP itd.
-
-    // normalizacja whitespace:
-    s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    s = s.replace(/[ \t]+/g, " ");
-    s = s.replace(/\n[ \t]+/g, "\n");
-    s = s.replace(/\n{3,}/g, "\n\n");
-
-    return s.trim();
-  }
-
-  // =========================================================
-  // Helpers: getAsync z timeoutem (Forcepoint-style)
+  // getAsync z timeoutem (Forcepoint-style)
   // =========================================================
   function getAsyncValue(getter, timeoutMs, onValue) {
     var done = false;
@@ -278,22 +229,53 @@
 
   function normalizeFromObj(v) {
     if (!v) return { emailAddress: "", displayName: "" };
-    // może już być w formacie {emailAddress, displayName}
-    if (v.emailAddress || v.displayName) {
-      return { emailAddress: v.emailAddress || "", displayName: v.displayName || "" };
-    }
-    // lub string
-    if (typeof v === "string") {
-      return { emailAddress: v, displayName: "" };
-    }
+    if (v.emailAddress || v.displayName) return { emailAddress: v.emailAddress || "", displayName: v.displayName || "" };
+    if (typeof v === "string") return { emailAddress: v, displayName: "" };
     return { emailAddress: "", displayName: "" };
   }
 
   // =========================================================
-  // Attachments: jak w olk.exe (jeśli API dostępne)
+  // BODY NORMALIZATION: DOMParser -> tylko <body> (bez head i bez komentarzy)
+  // To naprawia: "Clean / DocumentEmail / false..." i poprawia spacje.
+  // =========================================================
+  function htmlToPlainTextBodyOnly(html) {
+    try {
+      var s = String(html || "");
+
+      // parse jako pełny dokument HTML
+      var doc = new DOMParser().parseFromString(s, "text/html");
+      if (!doc) return "";
+
+      // usuń style/script
+      var rm = doc.querySelectorAll("style,script");
+      for (var i = 0; i < rm.length; i++) rm[i].remove();
+
+      var body = doc.body;
+      var text = "";
+      if (body) {
+        // innerText lepiej zachowuje łamania linii niż textContent
+        text = body.innerText || body.textContent || "";
+      }
+
+      // NBSP -> space (to często jest "zjedzona spacja" między słowami)
+      text = text.replace(/[\u00A0\u2007\u202F]/g, " ");
+
+      // normalizacja whitespace, ale NIE usuwamy wszystkich spacji
+      text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      text = text.replace(/[ \t]+/g, " ");
+      text = text.replace(/\n[ \t]+/g, "\n");
+      text = text.replace(/\n{3,}/g, "\n\n");
+
+      return text.trim();
+    } catch (e) {
+      return "";
+    }
+  }
+
+  // =========================================================
+  // Attachments: jak Forcepoint (jeśli API dostępne)
   // =========================================================
   function getAttachmentsLikeForcepoint(item, tx, cb) {
-    // jeśli API nie istnieje, od razu []
     if (!item || typeof item.getAttachmentsAsync !== "function") {
       cb([]);
       return;
@@ -307,9 +289,8 @@
 
       logD(tx, "Attachment list size: " + attList.length);
 
-      // jeśli brak API do pobierania contentu
       if (typeof item.getAttachmentContentAsync !== "function") {
-        cb([]);
+        cb([]); // brak API do contentu w danym host/capability
         return;
       }
 
@@ -320,7 +301,6 @@
       function finish() {
         if (finished) return;
         finished = true;
-        // filtruj null (jak w olk.exe)
         cb(results.filter(Boolean));
       }
 
@@ -328,7 +308,6 @@
         (function (att) {
           var resolved = false;
 
-          // timeout per attachment (jak w olk.exe)
           var t = setTimeout(function () {
             if (resolved) return;
             resolved = true;
@@ -347,13 +326,21 @@
                 var val = r.value;
                 var base64 = val.content;
 
-                // Forcepoint: jeśli nie base64 -> btoa
+                // UWAGA: btoa na binarnych/unicode potrafi wybuchnąć.
+                // Jeśli engine potrzebuje base64, a format != base64, to bezpieczniej i tak wysłać bez konwersji
+                // albo zrobić konwersję przez Uint8Array (cięższe). Tu trzymamy się prostego Forcepoint-like.
                 try {
                   if (val.format !== "base64") {
                     base64 = btoa(val.content);
                     logD(tx, "Encoded attachment in base64");
                   }
-                } catch (e0) {}
+                } catch (e0) {
+                  // fallback: pomiń ten załącznik, żeby nie wysypać flow
+                  results.push(null);
+                  pending--;
+                  if (pending <= 0) finish();
+                  return;
+                }
 
                 results.push({
                   file_name: att.name,
@@ -378,7 +365,6 @@
         })(attList[i]);
       }
 
-      // safety: gdyby nic nie zawołało
       setTimeout(finish, CFG.attachmentContentTimeoutMs + 1000);
     });
   }
@@ -387,7 +373,6 @@
   // Collect payload (Message/Appointment)
   // =========================================================
   function collectPayload(item, tx, cb) {
-    // wspólny szkielet
     var payload = {
       subject: "",
       body: "",
@@ -399,12 +384,12 @@
       attachments: []
     };
 
-    // body html -> plain text (Forcepoint-like)
     function getBody(done) {
       if (!item || !item.body || typeof item.body.getAsync !== "function") {
         done("");
         return;
       }
+
       getAsyncValue(
         function (cb2) { item.body.getAsync(Office.CoercionType.Html, cb2); },
         CFG.bodyTimeoutMs,
@@ -414,25 +399,25 @@
             logD(tx, "=== Raw HTML Body ===");
             logD(tx, truncateForLog(html));
           }
-          var plain = htmlToPlainTextForcepointLike(html);
+
+          var plain = htmlToPlainTextBodyOnly(html);
+
           if (CFG.debugLevel >= 3) {
             logD(tx, "=== Normalized Text ===");
             logD(tx, truncateForLog(plain));
           }
+
           done(plain);
         }
       );
     }
 
-    // MESSAGE
     if (item.itemType === "message") {
       logI(tx, "Validating message");
 
-      // server check jest robiony wcześniej pingiem, tu tylko dane
       getAsyncValue(function (cb2) { item.subject.getAsync(cb2); }, CFG.fieldTimeoutMs, function (subject) {
         payload.subject = subject || "";
 
-        // from: preferuj message.from.getAsync (jak olk.exe), fallback: userProfile
         var gotFrom = false;
         if (item.from && typeof item.from.getAsync === "function") {
           getAsyncValue(function (cb3) { item.from.getAsync(cb3); }, CFG.fieldTimeoutMs, function (fromVal) {
@@ -478,14 +463,12 @@
       return;
     }
 
-    // APPOINTMENT
     if (item.itemType === "appointment") {
       logI(tx, "Validating appointment");
 
       getAsyncValue(function (cb2) { item.subject.getAsync(cb2); }, CFG.fieldTimeoutMs, function (subject) {
         payload.subject = subject || "";
 
-        // organizer
         if (item.organizer && typeof item.organizer.getAsync === "function") {
           getAsyncValue(function (cb3) { item.organizer.getAsync(cb3); }, CFG.fieldTimeoutMs, function (orgVal) {
             payload.from = normalizeFromObj(orgVal);
@@ -496,7 +479,6 @@
         }
 
         function afterOrg() {
-          // required/optional attendees -> mapujemy jako "to"/"cc" (jak w Forcepoint)
           if (item.requiredAttendees && typeof item.requiredAttendees.getAsync === "function") {
             getAsyncValue(function (cb4) { item.requiredAttendees.getAsync(cb4); }, CFG.fieldTimeoutMs, function (req) {
               payload.to = mapRecipsToObjects(req || []);
@@ -517,7 +499,6 @@
             }
 
             function afterOpt() {
-              // location
               if (item.location && typeof item.location.getAsync === "function") {
                 getAsyncValue(function (cb6) { item.location.getAsync(cb6); }, CFG.fieldTimeoutMs, function (loc) {
                   payload.location = loc || "";
@@ -545,7 +526,6 @@
       return;
     }
 
-    // fallback
     logE(tx, "message item type unknown", { itemType: item.itemType });
     cb(payload);
   }
@@ -563,22 +543,19 @@
   }
 
   // =========================================================
-  // Handle response (dokładnie jak olk.exe: action==1 => block)
+  // Forcepoint semantics: action==1 => BLOCK else ALLOW
   // =========================================================
   function handleResponse(obj, tx, finish) {
     logI(tx, "Handling response from engine");
 
-    // RAW response (DBG)
     if (CFG.debugLevel >= 3) {
       logD(tx, "Engine raw response (truncated)");
-      logD(tx, truncateForLog(JSON.stringify(obj)));
+      try { logD(tx, truncateForLog(JSON.stringify(obj))); } catch (e) {}
     }
 
     var actionVal = obj ? obj.action : null;
     if (typeof actionVal === "string") actionVal = actionVal.trim();
 
-    // Forcepoint semantics:
-    // action === 1 -> BLOCK
     var isBlock = (actionVal === 1 || actionVal === "1");
 
     if (isBlock) {
@@ -592,6 +569,43 @@
   }
 
   // =========================================================
+  // POST to classifier with retry when HTTP0/network
+  // 1st try: headers per CFG (default: none)
+  // retry: if fail and we had headers -> retry with NO headers
+  // =========================================================
+  function postToClassifier(tx, classifyUrl, payloadStr, cb) {
+    var headers = null;
+
+    if (CFG.postContentType && String(CFG.postContentType).trim()) {
+      headers = { "Content-Type": String(CFG.postContentType).trim() };
+    }
+
+    logD(tx, "Classifier POST", {
+      url: classifyUrl,
+      contentType: headers ? headers["Content-Type"] : "(none)",
+      bytes: payloadStr ? payloadStr.length : 0
+    });
+
+    xhr("POST", classifyUrl, payloadStr, CFG.classifyTimeoutMs, headers, function (err, respText) {
+      if (!err) { cb(null, respText); return; }
+
+      // retry only for network-ish errors, and only if first try had headers
+      var em = (err && err.message) ? err.message : "";
+      var isNet = /HTTP 0|network|abort|timeout/i.test(em);
+
+      if (isNet && headers) {
+        logE(tx, "classify failed (will retry without headers)", { err: em, url: classifyUrl });
+        xhr("POST", classifyUrl, payloadStr, CFG.classifyTimeoutMs, null, function (err2, respText2) {
+          cb(err2, respText2);
+        });
+        return;
+      }
+
+      cb(err, respText);
+    });
+  }
+
+  // =========================================================
   // Main OnSend handler
   // =========================================================
   window.onMessageSendHandler = function onMessageSendHandler(event) {
@@ -602,15 +616,10 @@
     function ms() { return Date.now() - t0; }
 
     logI(tx, "FP email validation started - [v1.2]");
-    try {
-      var plat = Office.context && Office.context.diagnostics && Office.context.diagnostics.platform;
-      if (plat === "Mac") logI(tx, "MacOS detected");
-      else logI(tx, "WindowsOS detected");
-    } catch (e0) {}
+    try { logI(tx, "WindowsOS detected"); } catch (e0) {}
 
     notifyInfo("Checking DLP...");
 
-    // watchdog – nigdy nie wieszaj send
     var watchdog = setTimeout(function () {
       logE(tx, "WATCHDOG fired", { ms: ms() });
       notifyInfo("DLP timeout – allow (watchdog).");
@@ -623,7 +632,7 @@
       complete(allow, reason);
     }
 
-    // 1) server check
+    // 1) ping
     logI(tx, "Checking the server");
     var pingUrl = CFG.agentBase + CFG.pingPath;
 
@@ -635,7 +644,6 @@
           notifyBlocked("Blocked by DLP engine (server down)");
           finish(false, "server_down_fail_closed");
         } else {
-          // fail-open
           finish(true, "server_down_fail_open");
         }
         return;
@@ -643,27 +651,22 @@
 
       logI(tx, "Server is UP");
 
-      // 2) validate/collect data
       var item = Office.context.mailbox.item;
       logI(tx, "Posting message");
       logD(tx, "Trying to post");
 
       collectPayload(item, tx, function (payloadObj) {
-        // DBG: podgląd fragmentu body, żeby widzieć spacje
         if (CFG.debugLevel >= 3) {
-          var preview = (payloadObj.body || "").slice(0, 200);
+          var preview = (payloadObj.body || "").slice(0, 220);
           logD(tx, "Payload body preview", preview);
         }
 
         logD(tx, "Sending event to classifier");
 
-        // 3) send to classifier
         var classifyUrl = CFG.agentBase + CFG.classifyPath;
         var payloadStr = JSON.stringify(payloadObj);
 
-        var headers = { "Content-Type": CFG.postContentType };
-
-        xhr("POST", classifyUrl, payloadStr, CFG.classifyTimeoutMs, headers, function (classErr, respText) {
+        postToClassifier(tx, classifyUrl, payloadStr, function (classErr, respText) {
           if (classErr) {
             logE(tx, "classify failed", { err: classErr.message, url: classifyUrl, ms: ms() });
 
@@ -676,17 +679,14 @@
             return;
           }
 
-          // parse JSON
           var obj = safeJsonParse(respText || "");
           if (!obj) {
-            // w dev loguj raw string
             if (CFG.debugLevel >= 3) {
               logD(tx, "Engine raw response (string, truncated)");
               logD(tx, truncateForLog(respText || ""));
             }
 
             logE(tx, "Engine response is not JSON");
-
             if (CFG.failClosed) {
               notifyBlocked("Blocked by DLP engine (invalid response)");
               finish(false, "invalid_response_fail_closed");
