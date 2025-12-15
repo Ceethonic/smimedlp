@@ -1,75 +1,101 @@
-/* global Office, OfficeRuntifme */
+/* global Office, OfficeRuntime */
+
+"use strict";
 
 const LOG_KEY = "DLP_DIAG_LOGS";
-const CFG_LOG_ENABLE = "DLP_DEV_LOG_ENABLE";
-const CFG_NO_CT = "DLP_DEV_NO_CONTENT_TYPE";
+const FLAG_LOG_UI = "DLP_DEV_LOG_ENABLE";
 
-let bc = null;
-try { if (typeof BroadcastChannel !== "undefined") bc = new BroadcastChannel("dlp_diag"); } catch (e) {}
+function $(id){ return document.getElementById(id); }
 
-function $(id) { return document.getElementById(id); }
-
-function safeParse(s) { try { return s ? JSON.parse(s) : []; } catch (e) { return []; } }
-
-async function getLogs() {
+async function readLogs() {
+  // Prefer OfficeRuntime.storage (shared)
   try {
     if (typeof OfficeRuntime !== "undefined" && OfficeRuntime.storage && OfficeRuntime.storage.getItem) {
       const raw = await OfficeRuntime.storage.getItem(LOG_KEY);
-      return safeParse(raw);
+      if (raw) return JSON.parse(raw);
     }
   } catch (e) {}
-  // fallback localStorage (if storage not available)
-  return safeParse(localStorage.getItem(LOG_KEY));
+
+  // Fallback localStorage
+  try {
+    const raw = localStorage.getItem(LOG_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (e2) {
+    return [];
+  }
 }
 
-async function setFlag(key, val) {
+async function writeFlagUi(v) {
+  const val = v ? "1" : "0";
   try {
     if (typeof OfficeRuntime !== "undefined" && OfficeRuntime.storage && OfficeRuntime.storage.setItem) {
-      await OfficeRuntime.storage.setItem(key, String(val));
+      await OfficeRuntime.storage.setItem(FLAG_LOG_UI, val);
       return;
     }
   } catch (e) {}
-  try { localStorage.setItem(key, String(val)); } catch (e2) {}
+  try { localStorage.setItem(FLAG_LOG_UI, val); } catch (e2) {}
+}
+
+async function readFlagUi() {
+  try {
+    if (typeof OfficeRuntime !== "undefined" && OfficeRuntime.storage && OfficeRuntime.storage.getItem) {
+      const v = await OfficeRuntime.storage.getItem(FLAG_LOG_UI);
+      if (v !== null && v !== undefined) return String(v) === "1";
+    }
+  } catch (e) {}
+  try { return localStorage.getItem(FLAG_LOG_UI) === "1"; } catch (e2) { return false; }
 }
 
 async function clearLogs() {
+  const empty = JSON.stringify([]);
   try {
     if (typeof OfficeRuntime !== "undefined" && OfficeRuntime.storage && OfficeRuntime.storage.setItem) {
-      await OfficeRuntime.storage.setItem(LOG_KEY, JSON.stringify([]));
-      return;
+      await OfficeRuntime.storage.setItem(LOG_KEY, empty);
     }
   } catch (e) {}
-  try { localStorage.setItem(LOG_KEY, JSON.stringify([])); } catch (e2) {}
+  try { localStorage.setItem(LOG_KEY, empty); } catch (e2) {}
 }
 
-function render(arr) {
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type:"text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 0);
+}
+
+async function render() {
+  const arr = await readLogs();
   const lines = (arr || []).map(e => {
-    const extra = e.extra ? " " + (typeof e.extra === "string" ? e.extra : JSON.stringify(e.extra)) : "";
-    return `${e.ts || ""} [${e.lvl || "INF"}] ${e.msg || ""}${extra}`;
+    const extra = e.extra ? " " + JSON.stringify(e.extra) : "";
+    return `${e.ts || ""} [${e.lvl || "INF"}] [${e.tx || ""}] ${e.msg || ""}${extra}`;
   });
-  $("out").textContent = lines.join("\n");
-}
-
-async function refresh() {
-  const logs = await getLogs();
-  render(logs);
+  $("out").value = lines.join("\n");
+  $("out").scrollTop = $("out").scrollHeight;
 }
 
 Office.onReady().then(async () => {
-  $("btnRefresh").onclick = refresh;
-  $("btnClear").onclick = async () => { await clearLogs(); await refresh(); };
+  $("chkUi").checked = await readFlagUi();
 
-  $("btnEnableLogs").onclick = async () => { await setFlag(CFG_LOG_ENABLE, "1"); await refresh(); };
-  $("btnDisableLogs").onclick = async () => { await setFlag(CFG_LOG_ENABLE, "0"); await refresh(); };
+  $("chkUi").onchange = async () => {
+    await writeFlagUi($("chkUi").checked);
+  };
 
-  $("btnNoCtOn").onclick = async () => { await setFlag(CFG_NO_CT, "1"); await refresh(); };
-  $("btnNoCtOff").onclick = async () => { await setFlag(CFG_NO_CT, "0"); await refresh(); };
+  $("btnClear").onclick = async () => { await clearLogs(); await render(); };
+  $("btnRefresh").onclick = render;
 
-  if (bc) {
-    bc.onmessage = async () => { await refresh(); };
-  }
+  $("btnDownload").onclick = async () => {
+    const arr = await readLogs();
+    const lines = (arr || []).map(e => {
+      const extra = e.extra ? " " + JSON.stringify(e.extra) : "";
+      return `${e.ts || ""} [${e.lvl || "INF"}] [${e.tx || ""}] ${e.msg || ""}${extra}`;
+    }).join("\n");
+    downloadText("dlp-dev-logs.txt", lines);
+  };
 
-  // poll as fallback
-  setInterval(refresh, 1000);
-  await refresh();
+  setInterval(render, 1000);
+  await render();
 });
