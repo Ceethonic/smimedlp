@@ -1,376 +1,545 @@
-/* global Office, OfficeRuntime */
+/* global Office */
 
-"use strict";
+// SMIME DLP (Outlook.exe) - app.js
+// - Collects subject/from/to/cc/bcc/location/body + attachments
+// - POSTs to local Forcepoint agent: https://localhost:55299/OutlookAddin
+// - Expects JSON response: { action: 0|1 } (0=allow, 1=block)
+// - Logs to console + localStorage (view in diagnostics.html)
 
-/**
- * appvprem.js - classic Outlook (outlook.exe) ItemSend
- * - Ping timeout: 30000 ms (Forcepoint)
- * - POST timeout: 35000 ms (Forcepoint)
- * - NO retry POST (retry can break agent confirm/session)
- * - Logs written to OfficeRuntime.storage (shared) + fallback localStorage
- */
+(() => {
+  "use strict";
 
-const VERSION = "v1.2-prem-forcepoint-timeouts";
+  const VERSION = "vprem-1.3";
+  const LOG_KEY = "smimeDlp.logs.v1";
+  const DEBUG_KEY = "smimeDlp.debug.v1";         // "1" enables verbose UI + extra logs
+  const POST_TIMEOUT_KEY = "smimeDlp.postTimeoutMs.v1"; // optional override
 
-const PORT_WIN = 55299;
-const PORT_MAC = 55296;
+  let urlDseRoot = "https://localhost:55299/"; // Windows default (outlook.exe)
+  const PING_PATH = "FirefoxExt/_1";
+  const CLASSIFY_PATH = "OutlookAddin";
 
-const PING_TIMEOUT_MS = 30000;   // as original
-const POST_TIMEOUT_MS = 35000;   // as original
-const FIELD_TIMEOUT_MS = 3000;
-const BODY_TIMEOUT_MS = 5000;
-const ATTS_LIST_TIMEOUT_MS = 5000;
-const ATT_CONTENT_TIMEOUT_MS = 30000;
+  // ---------- Logging (console + storage + BroadcastChannel) ----------
+  const MAX_LOG_ITEMS = 2000;
 
-const LOG_KEY = "DLP_DIAG_LOGS";           // array of entries
-const FLAG_LOG_UI = "DLP_DEV_LOG_ENABLE";  // "1" / "0"
+  function isoNow() {
+    return new Date().toISOString();
+  }
 
-let urlDseRoot = "https://localhost:55299/";
-let logUiEnable = false;
+  function safeJson(obj) {
+    try { return JSON.stringify(obj); } catch { return "\"<unserializable>\""; }
+  }
 
-let logBuf = [];
-let flushTimer = null;
-let flushing = false;
-const MAX_LOGS = 400;
+  function isDebug() {
+    try { return localStorage.getItem(DEBUG_KEY) === "1"; } catch { return false; }
+  }
 
-Office.initialize = function () {};
-
-function osPlatform() {
-  try {
-    const p = Office.context.diagnostics.platform;
-    if (p === "Mac") return "Mac";
-    if (p === "PC" || p === "OfficeOnline") return "Win";
-  } catch (e) {}
-  return "Other";
-}
-
-async function loadFlags() {
-  // Prefer OfficeRuntime.storage to share with diagnostics
-  try {
-    if (typeof OfficeRuntime !== "undefined" && OfficeRuntime.storage && OfficeRuntime.storage.getItem) {
-      const v = await OfficeRuntime.storage.getItem(FLAG_LOG_UI).catch(() => null);
-      if (v !== null) logUiEnable = (String(v) === "1");
-      return;
-    }
-  } catch (e) {}
-
-  try { logUiEnable = (localStorage.getItem(FLAG_LOG_UI) === "1"); } catch (e2) {}
-}
-
-function nowIso() { return new Date().toISOString(); }
-
-function pushLog(level, tx, msg, extra) {
-  const entry = { ts: nowIso(), lvl: level, tx, msg: String(msg), extra: extra || null };
-
-  try {
-    const line = `${entry.ts} [${entry.lvl}] [${entry.tx}] ${entry.msg}`;
-    if (level === "ERR") console.error(line, entry.extra || "");
-    else if (level === "DBG") console.debug(line, entry.extra || "");
-    else console.log(line, entry.extra || "");
-  } catch (e) {}
-
-  // UI progressIndicator (optional, no sleep/busy wait)
-  if (logUiEnable && typeof msg === "string") {
+  function getPostTimeoutMs() {
+    // Default: 120s (confirm can take time). Original Forcepoint used 35s.
+    const def = 120000;
     try {
-      Office.context.mailbox.item.notificationMessages.replaceAsync("dlpDev", {
+      const v = Number(localStorage.getItem(POST_TIMEOUT_KEY));
+      return Number.isFinite(v) && v > 0 ? v : def;
+    } catch {
+      return def;
+    }
+  }
+
+  function loadLogBuffer() {
+    try {
+      const raw = localStorage.getItem(LOG_KEY);
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveLogBuffer(arr) {
+    try { localStorage.setItem(LOG_KEY, JSON.stringify(arr)); } catch { /* ignore */ }
+  }
+
+  function appendLog(entry) {
+    const buf = loadLogBuffer();
+    buf.push(entry);
+    while (buf.length > MAX_LOG_ITEMS) buf.shift();
+    saveLogBuffer(buf);
+
+    try {
+      const bc = new BroadcastChannel("smimeDlpLogs");
+      bc.postMessage(entry);
+      bc.close();
+    } catch { /* ignore */ }
+  }
+
+  let lastUiTs = 0;
+  function uiProgress(message) {
+    if (!isDebug()) return;
+    const now = Date.now();
+    if (now - lastUiTs < 800) return;
+    lastUiTs = now;
+
+    try {
+      const item = Office.context.mailbox.item;
+      item.notificationMessages.replaceAsync("smimeDlpProgress", {
         type: "progressIndicator",
-        message: msg.substring(0, Math.min(msg.length, 250)),
+        message: String(message).substring(0, 250),
       });
-    } catch (e2) {}
+    } catch { /* ignore */ }
   }
 
-  logBuf.push(entry);
-  if (logBuf.length > MAX_LOGS) logBuf = logBuf.slice(logBuf.length - MAX_LOGS);
+  function printLog(level, msg, meta) {
+    const entry = {
+      ts: isoNow(),
+      level,
+      msg: String(msg),
+      meta: meta ?? null
+    };
 
-  if (!flushTimer) {
-    flushTimer = setTimeout(() => {
-      flushTimer = null;
-      flushLogs().catch(() => {});
-    }, 250);
-  }
-}
-
-async function flushLogs() {
-  if (flushing) return;
-  flushing = true;
-  try {
-    const raw = JSON.stringify(logBuf);
-
-    // write shared storage
+    // Console
     try {
-      if (typeof OfficeRuntime !== "undefined" && OfficeRuntime.storage && OfficeRuntime.storage.setItem) {
-        await OfficeRuntime.storage.setItem(LOG_KEY, raw);
+      const line = `${entry.ts} [${level}] ${entry.msg}` + (entry.meta ? ` ${safeJson(entry.meta)}` : "");
+      if (level === "ERR") console.error(line);
+      else if (level === "DBG") console.debug(line);
+      else console.log(line);
+    } catch { /* ignore */ }
+
+    // Storage
+    appendLog(entry);
+
+    // UI (optional)
+    uiProgress(entry.msg);
+  }
+
+  function logInf(msg, meta) { printLog("INF", msg, meta); }
+  function logDbg(msg, meta) { printLog("DBG", msg, meta); }
+  function logErr(msg, meta) { printLog("ERR", msg, meta); }
+
+  // ---------- Helpers ----------
+  function sleepBusy(ms) {
+    const start = Date.now();
+    while (Date.now() - start < ms) { /* busy */ }
+  }
+
+  function operatingSystem() {
+    // Outlook desktop on Windows => "PC"
+    // New Outlook / OWA often => "OfficeOnline"
+    const platform = Office?.context?.diagnostics?.platform;
+    if (platform === "Mac") return "MacOS";
+    if (platform === "PC") return "WindowsDesktop";
+    if (platform === "OfficeOnline") return "OfficeOnline";
+    return "Other";
+  }
+
+  function getIfVal(result) {
+    return result && result.status === Office.AsyncResultStatus.Succeeded ? result.value : "";
+  }
+
+  function withTimeout(ms, promise, onTimeoutValue) {
+    return new Promise((resolve) => {
+      let done = false;
+      const t = setTimeout(() => {
+        if (done) return;
+        done = true;
+        resolve(onTimeoutValue);
+      }, ms);
+
+      Promise.resolve(promise)
+        .then((v) => {
+          if (done) return;
+          done = true;
+          clearTimeout(t);
+          resolve(v);
+        })
+        .catch(() => {
+          if (done) return;
+          done = true;
+          clearTimeout(t);
+          resolve(onTimeoutValue);
+        });
+    });
+  }
+
+  function extractBodyHtml(html) {
+    // Try to keep only <body>...</body> (classic Outlook can return full Word HTML doc).
+    try {
+      const lower = html.toLowerCase();
+      const b0 = lower.indexOf("<body");
+      if (b0 >= 0) {
+        const bStart = lower.indexOf(">", b0);
+        const bEnd = lower.lastIndexOf("</body>");
+        if (bStart >= 0 && bEnd > bStart) {
+          html = html.substring(bStart + 1, bEnd);
+        }
       }
-    } catch (e) {}
 
-    // fallback localStorage
-    try { localStorage.setItem(LOG_KEY, raw); } catch (e2) {}
-  } finally {
-    flushing = false;
+      // Remove style/script blocks + conditional comments that add noise
+      html = html.replace(/<style[\s\S]*?<\/style>/gi, "");
+      html = html.replace(/<script[\s\S]*?<\/script>/gi, "");
+      html = html.replace(/<!--[\s\S]*?-->/g, "");
+      html = html.replace(/<!\[if[\s\S]*?\]>/gi, "");
+      html = html.replace(/~~themedata~~/gi, "");
+      html = html.replace(/~~colorschememapping~~/gi, "");
+      return html;
+    } catch {
+      return html;
+    }
   }
-}
 
-function mkLogger(tx) {
-  return {
-    inf: (m, x) => pushLog("INF", tx, m, x),
-    dbg: (m, x) => pushLog("DBG", tx, m, x),
-    err: (m, x) => pushLog("ERR", tx, m, x),
-  };
-}
-
-function fetchWithTimeout(url, init, timeoutMs) {
-  if (typeof AbortController === "undefined") return fetch(url, init);
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  const req = Object.assign({}, init || {}, { signal: controller.signal });
-  return fetch(url, req).finally(() => clearTimeout(t));
-}
-
-// Optional cleanup for Word/MSO junk (keeps Forcepoint behaviour: strip tags only, keep &nbsp;)
-function extractBodyAndCleanMso(html) {
-  let s = String(html || "");
-  s = s.replace(/<head[\s\S]*?<\/head>/gi, "");
-  s = s.replace(/<!--\s*\[if[\s\S]*?<!\s*\[endif\]\s*-->/gi, "");
-  const m = s.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-  return (m && m[1] !== undefined) ? m[1] : s;
-}
-function normalizeHtmlToPlainText(htmlBody) {
-  const cleaned = extractBodyAndCleanMso(htmlBody);
-  return cleaned.replace(/<[^>]+>/g, "");
-}
-
-function getIfVal(result) {
-  return (result && result.status === Office.AsyncResultStatus.Succeeded) ? result.value : "";
-}
-
-function completeOnceFactory(event, log) {
-  let done = false;
-  return function completeOnce(allow, reason) {
-    if (done) return;
-    done = true;
-    log.inf("completed", { allow: !!allow, reason: reason || "" });
-    try { event.completed({ allowEvent: !!allow }); } catch (e) {}
-  };
-}
-
-async function httpServerCheck(log) {
-  log.inf("Checking the server");
-  const url = urlDseRoot + "FirefoxExt/_1";
-
-  const r = await fetchWithTimeout(url, {
-    method: "GET",
-    mode: "cors",
-    cache: "no-cache",
-    credentials: "same-origin",
-    redirect: "follow",
-    referrerPolicy: "no-referrer",
-  }, PING_TIMEOUT_MS);
-
-  if (!r.ok) throw new Error("ping_http_" + r.status);
-  log.inf("Server is UP");
-}
-
-function handleResponse(data, event, log, completeOnce) {
-  log.inf("Handling response from engine");
-  const item = Office.context.mailbox.item;
-
-  // Forcepoint semantics: action === 1 => BLOCK, else => ALLOW
-  if (data && data["action"] === 1) {
+  function normalizeHtmlToText(html) {
+    // Forcepoint-like: strip tags, DO NOT decode entities (keeps &nbsp;)
+    // Also do NOT trim, to avoid eating intentional spaces.
     try {
-      item.notificationMessages.addAsync("NoSend", { type: "errorMessage", message: "Blocked by DLP engine" });
-    } catch (e) {}
-    log.inf("DLP block", data);
-    completeOnce(false, "blocked");
-  } else {
-    log.inf("DLP allow", data);
-    completeOnce(true, "allowed");
+      return String(html).replace(/<[^>]+>/g, "");
+    } catch {
+      return "";
+    }
   }
-}
 
-async function sendToClassifier(data, event, log, completeOnce) {
-  log.inf("Sending event to classifier");
+  // ---------- Networking ----------
+  async function httpServerCheck() {
+    logInf("Checking the server");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
 
-  // heartbeat co 5s (tylko informacyjne)
-  const hb = setInterval(() => {
-    log.inf("Waiting for DLP decision (confirm popup may be active)...");
-  }, 5000);
+    try {
+      const resp = await fetch(urlDseRoot + PING_PATH, {
+        signal: controller.signal,
+        method: "GET",
+        mode: "cors",
+        cache: "no-cache",
+        credentials: "same-origin",
+        redirect: "follow",
+        referrerPolicy: "no-referrer",
+      });
+      clearTimeout(timeout);
 
-  try {
-    const url = urlDseRoot + "OutlookAddin";
+      if (!resp.ok) {
+        logErr("Server is down", { status: resp.status });
+        return false;
+      }
+      logInf("Server is UP");
+      return true;
+    } catch (e) {
+      clearTimeout(timeout);
+      logErr("Server check crashed", { name: e?.name, message: e?.message });
+      return false;
+    }
+  }
 
-    const resp = await fetchWithTimeout(url, {
-      method: "POST",
-      mode: "cors",
-      cache: "no-cache",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      redirect: "follow",
-      referrerPolicy: "no-referrer",
-      body: JSON.stringify(data),
-    }, POST_TIMEOUT_MS);
+  async function sendToClassifier(url, data, event, tx) {
+    logInf("Sending event to classifier");
+    const controller = new AbortController();
+    const timeoutMs = getPostTimeoutMs();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-    if (!resp.ok) {
-      log.err("Engine returned error", { status: resp.status });
-      completeOnce(true, "engine_http_error_fail_open");
-      return;
+    // Optional "waiting..." debug heartbeat (no busy-wait)
+    let waitTimer = null;
+    if (isDebug()) {
+      waitTimer = setInterval(() => {
+        logInf("Waiting for DLP decision (confirm popup may be active)...", { tx });
+      }, 1000);
     }
 
-    // Forcepoint does response.json()
-    const json = await resp.json().catch(() => null);
-    if (!json) {
-      log.err("Engine response is not JSON");
-      completeOnce(true, "invalid_json_fail_open");
-      return;
+    try {
+      const resp = await fetch(url, {
+        signal: controller.signal,
+        method: "POST",
+        mode: "cors",
+        cache: "no-cache",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        redirect: "follow",
+        referrerPolicy: "no-referrer",
+        body: JSON.stringify(data),
+      });
+
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+
+      const json = await resp.json();
+      clearTimeout(timeout);
+      if (waitTimer) clearInterval(waitTimer);
+      handleResponse(json, event, tx);
+    } catch (e) {
+      clearTimeout(timeout);
+      if (waitTimer) clearInterval(waitTimer);
+      logErr("Classifier request crashed", { tx, name: e?.name, message: e?.message });
+      handleError(e, event, tx);
     }
-
-    handleResponse(json, event, log, completeOnce);
-  } catch (e) {
-    log.err("Request crashed", { name: e && e.name ? e.name : "error", msg: e && e.message ? e.message : String(e) });
-    completeOnce(true, "classify_error_fail_open");
-  } finally {
-    clearInterval(hb);
   }
-}
 
-async function tryPost(event, log, completeOnce, subject, from, to, cc, bcc, location, body, attachments) {
-  log.inf("Trying to post");
-  const payload = { subject, body, from, to, cc, bcc, location, attachments };
-  log.dbg("Payload (truncated)", { subjectLen: (subject || "").length, bodyLen: (body || "").length, attCount: (attachments || []).length });
-  await sendToClassifier(payload, event, log, completeOnce);
-}
+  // ---------- DLP decision ----------
+  function handleResponse(data, event, tx) {
+    logInf("Handling response from engine", { tx });
+    logDbg("Engine raw response (truncated)", { tx, data });
 
-async function postMessage(message, event, log, completeOnce, subject, from, to, cc, bcc, location, body, attachmentsAsyncResult) {
-  log.inf("Posting message");
+    const action = Number(data && data.action);
+    const item = Office.context.mailbox.item;
 
-  if (attachmentsAsyncResult !== null) {
-    const list = attachmentsAsyncResult.value || [];
-    log.dbg("Attachment list size: " + list.length);
+    if (action === 1) {
+      try {
+        item.notificationMessages.addAsync("NoSend", {
+          type: "errorMessage",
+          message: "Blocked by DLP engine"
+        });
+      } catch { /* ignore */ }
 
-    if (list.length > 0 && typeof message.getAttachmentContentAsync === "function") {
-      const mapped = await Promise.all(
-        list.map(att => new Promise((resolve) => {
-          let finished = false;
-          const t = setTimeout(() => { if (!finished) { finished = true; resolve(null); } }, ATT_CONTENT_TIMEOUT_MS);
+      logInf("DLP block.", { tx });
+      event.completed({ allowEvent: false });
+      logInf("completed", { allow: false, reason: "blocked", tx });
+    } else {
+      logInf("DLP allow.", { tx });
+      event.completed({ allowEvent: true });
+      logInf("completed", { allow: true, reason: "allowed", tx });
+    }
+  }
 
-          message.getAttachmentContentAsync(att.id, (data) => {
-            if (finished) return;
-            finished = true;
-            clearTimeout(t);
+  function handleError(err, event, tx) {
+    // Fail open to avoid blocking mail if local agent is down
+    logErr("handleError", { tx, err: err?.message || String(err) });
+    try { event.completed({ allowEvent: true }); } catch { /* ignore */ }
+    logInf("completed", { allow: true, reason: "classify_error_fail_open", tx });
+  }
 
-            try {
-              let base64 = data.value.content;
-              if (data.value.format !== "base64") {
-                base64 = btoa(data.value.content);
-                log.dbg("Encoded attachment in base64");
+  // ---------- Message collection + attachments ----------
+  async function tryPost(event, subject, from, to, cc, bcc, location, body, attachments, tx) {
+    logInf("Trying to post", { tx });
+
+    const data = { subject, body, from, to, cc, bcc, location, attachments: attachments || [] };
+
+    if (data.attachments) logDbg("Attachment list size: " + data.attachments.length, { tx });
+
+    // Light payload stats (safe)
+    logDbg("Payload (truncated)", {
+      tx,
+      subjectLen: (subject && subject.length) || 0,
+      bodyLen: (body && body.length) || 0,
+      attCount: (data.attachments && data.attachments.length) || 0,
+    });
+
+    sendToClassifier(urlDseRoot + CLASSIFY_PATH, data, event, tx);
+  }
+
+  async function postMessage(message, event, subject, from, to, cc, bcc, location, body, attachments, tx) {
+    logInf("Posting message", { tx });
+
+    if (attachments !== null && attachments && Array.isArray(attachments.value)) {
+      const items = attachments.value;
+
+      const results = await Promise.all(
+        items.map((att) => new Promise((resolve) => {
+          let done = false;
+          const t = setTimeout(() => {
+            if (done) return;
+            done = true;
+            resolve(null);
+          }, 30000);
+
+          try {
+            message.getAttachmentContentAsync(att.id, (data) => {
+              if (done) return;
+              done = true;
+              clearTimeout(t);
+
+              try {
+                let base64EncodedContent = data?.value?.content || "";
+                if (data?.value?.format !== "base64") {
+                  // NOTE: btoa is ASCII-only; Forcepoint uses it anyway.
+                  try {
+                    base64EncodedContent = btoa(base64EncodedContent);
+                    logDbg("Encoded attachment in base64", { tx, name: att.name });
+                  } catch {
+                    // last resort: send as-is
+                  }
+                }
+
+                resolve({
+                  file_name: att.name,
+                  data: base64EncodedContent,
+                  content_type: att.contentType
+                });
+              } catch {
+                resolve(null);
               }
-              resolve({ file_name: att.name, data: base64, content_type: att.contentType });
-            } catch (e) {
-              resolve(null);
-            }
-          });
+            });
+          } catch {
+            clearTimeout(t);
+            resolve(null);
+          }
         }))
       );
 
-      await tryPost(event, log, completeOnce, subject, from, to, cc, bcc, location, body, mapped.filter(Boolean));
-      return;
+      tryPost(event, subject, from, to, cc, bcc, location, body, results.filter(Boolean), tx);
+    } else {
+      tryPost(event, subject, from, to, cc, bcc, location, body, [], tx);
     }
   }
 
-  await tryPost(event, log, completeOnce, subject, from, to, cc, bcc, location, body, []);
-}
+  async function validate(event, tx) {
+    const message = Office.context.mailbox.item;
+    const isAppointment = message.itemType === "appointment";
+    logInf(`Validating ${isAppointment ? "appointment" : "message"}`, { tx });
 
-async function validate(event, log, completeOnce) {
-  const message = Office.context.mailbox.item;
-  const isAppointment = message.itemType === "appointment";
-  log.inf(`Validating ${isAppointment ? "appointment" : "message"}`);
+    const fields = isAppointment ? [
+      message.subject.getAsync.bind(message.subject),
+      message.organizer.getAsync.bind(message.organizer),
+      message.requiredAttendees.getAsync.bind(message.requiredAttendees),
+      message.optionalAttendees.getAsync.bind(message.optionalAttendees),
+      message.location.getAsync.bind(message.location),
+    ] : [
+      message.subject.getAsync.bind(message.subject),
+      message.from.getAsync.bind(message.from),
+      message.to.getAsync.bind(message.to),
+      message.cc.getAsync.bind(message.cc),
+      message.bcc.getAsync.bind(message.bcc),
+    ];
 
-  const fields = isAppointment ? [
-    message.subject.getAsync.bind(message.subject),
-    message.organizer.getAsync.bind(message.organizer),
-    message.requiredAttendees.getAsync.bind(message.requiredAttendees),
-    message.optionalAttendees.getAsync.bind(message.optionalAttendees),
-    message.location.getAsync.bind(message.location)
-  ] : [
-    message.subject.getAsync.bind(message.subject),
-    message.from.getAsync.bind(message.from),
-    message.to.getAsync.bind(message.to),
-    message.cc.getAsync.bind(message.cc),
-    message.bcc.getAsync.bind(message.bcc)
-  ];
+    const values = await Promise.all([
+      httpServerCheck(),
 
-  const values = await Promise.all([
-    new Promise((resolve, reject) => { httpServerCheck(log).then(resolve).catch(reject); }),
+      // Subject/from/to/cc/bcc/location
+      ...fields.map((fn) => new Promise((resolve) => {
+        let done = false;
+        const t = setTimeout(() => {
+          if (done) return;
+          done = true;
+          resolve("");
+        }, 3000);
 
-    ...fields.map(fn => new Promise(resolve => {
-      setTimeout(() => resolve(""), FIELD_TIMEOUT_MS);
-      fn(result => resolve(getIfVal(result)));
-    })),
-
-    new Promise(resolve => {
-      setTimeout(() => resolve(""), BODY_TIMEOUT_MS);
-      message.body.getAsync(Office.CoercionType.Html, {}, (result) => {
-        if (result.status === Office.AsyncResultStatus.Succeeded) {
-          const htmlBody = result.value || "";
-          log.dbg("=== Raw HTML Body ===");
-          log.dbg(htmlBody);
-          const plain = normalizeHtmlToPlainText(htmlBody);
-          log.dbg("=== Normalized Text ===");
-          log.dbg(plain);
-          resolve(plain);
-        } else {
+        try {
+          fn((result) => {
+            if (done) return;
+            done = true;
+            clearTimeout(t);
+            resolve(getIfVal(result));
+          });
+        } catch {
+          if (done) return;
+          done = true;
+          clearTimeout(t);
           resolve("");
         }
-      });
-    }),
+      })),
 
-    new Promise(resolve => {
-      setTimeout(() => resolve(null), ATTS_LIST_TIMEOUT_MS);
-      if (typeof message.getAttachmentsAsync !== "function") { resolve(null); return; }
-      message.getAttachmentsAsync(result => {
-        if (result.status === Office.AsyncResultStatus.Succeeded && result.value && result.value.length > 0) resolve(result);
-        else resolve(null);
-      });
-    })
-  ]);
+      // Body HTML normalization
+      new Promise((resolve) => {
+        let done = false;
+        const t = setTimeout(() => {
+          if (done) return;
+          done = true;
+          resolve("");
+        }, 5000);
 
-  const [alive, ...rest] = values;
-  const [subject, from, to, cc, bcc, location, body, attachments] = isAppointment
-    ? [rest[0], rest[1], rest[2], rest[3], "", rest[4], rest[5], rest[6]]
-    : [rest[0], rest[1], rest[2], rest[3], rest[4], "", rest[5], rest[6]];
+        try {
+          message.body.getAsync(Office.CoercionType.Html, { asyncContext: event }, (result) => {
+            if (done) return;
+            done = true;
+            clearTimeout(t);
 
-  await postMessage(message, event, log, completeOnce, subject, from, to, cc, bcc, location, body, attachments);
-}
+            if (result.status === Office.AsyncResultStatus.Succeeded) {
+              const rawHtml = result.value || "";
+              logDbg("=== Raw HTML Body ===", { tx });
+              logDbg(rawHtml, { tx });
 
-function handleError(err, event, log, completeOnce) {
-  log.err("handleError", { err: err && err.message ? err.message : String(err) });
-  // Forcepoint-like fail-open
-  completeOnce(true, "error_fail_open");
-}
+              const extracted = extractBodyHtml(rawHtml);
+              const plainText = normalizeHtmlToText(extracted);
 
-function onMessageSendHandler(event) {
-  Office.onReady().then(async () => {
-    const tx = "TX-" + Date.now() + "-" + Math.floor(Math.random() * 1000000);
-    await loadFlags();
-    const log = mkLogger(tx);
-    const completeOnce = completeOnceFactory(event, log);
+              logDbg("=== Normalized Text ===", { tx });
+              logDbg(plainText, { tx });
 
-    log.inf(`FP email validation started - [${VERSION}]`);
+              resolve(plainText);
+            } else {
+              resolve("");
+            }
+          });
+        } catch {
+          if (done) return;
+          done = true;
+          clearTimeout(t);
+          resolve("");
+        }
+      }),
 
-    const os = osPlatform();
-    if (os === "Mac") {
-      urlDseRoot = `https://localhost:${PORT_MAC}/`;
-      log.inf("MacOS detected");
-    } else if (os === "Win") {
-      urlDseRoot = `https://localhost:${PORT_WIN}/`;
-      log.inf("WindowsOS detected");
-    } else {
-      log.err("OS is not MacOS or WindowsOS");
-      completeOnce(true, "unsupported_os_fail_open");
-      return;
+      // Attachments
+      new Promise((resolve) => {
+        let done = false;
+        const t = setTimeout(() => {
+          if (done) return;
+          done = true;
+          resolve(null);
+        }, 5000);
+
+        try {
+          message.getAttachmentsAsync((result) => {
+            if (done) return;
+            done = true;
+            clearTimeout(t);
+
+            if (result.status === Office.AsyncResultStatus.Succeeded && result.value && result.value.length > 0) {
+              resolve(result);
+            } else {
+              resolve(null);
+            }
+          });
+        } catch {
+          if (done) return;
+          done = true;
+          clearTimeout(t);
+          resolve(null);
+        }
+      }),
+    ]);
+
+    const [alive, ...rest] = values;
+    if (!alive) throw new Error("Server might be down");
+
+    const [subject, from, to, cc, bcc, location, body, attachments] = isAppointment
+      ? [rest[0], rest[1], rest[2], rest[3], "", rest[4], rest[5], rest[6]]
+      : [rest[0], rest[1], rest[2], rest[3], rest[4], "", rest[5], rest[6]];
+
+    await postMessage(message, event, subject, from, to, cc, bcc, location, body, attachments, tx);
+  }
+
+  // ---------- Entry point ----------
+  function onMessageSendHandler(event) {
+    const tx = `TX-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+
+    Office.onReady().then(() => {
+      logInf(`FP email validation started - [${VERSION}]`, { tx });
+
+      const os = operatingSystem();
+      if (os === "WindowsDesktop") {
+        logInf("WindowsOS detected", { tx });
+        urlDseRoot = "https://localhost:55299/";
+      } else if (os === "MacOS") {
+        logInf("MacOS detected", { tx });
+        urlDseRoot = "https://localhost:55296/";
+      } else if (os === "OfficeOnline") {
+        // New Outlook / OWA – keep Windows port by default unless you want separate routing
+        logInf("OfficeOnline detected", { tx });
+        urlDseRoot = "https://localhost:55299/";
+      } else {
+        logErr("OS is not supported", { tx, os });
+        handleError("Unsupported OS", event, tx);
+        return;
+      }
+
+      validate(event, tx).catch((err) => handleError(err, event, tx));
+    });
+  }
+
+  // Some hosts require Office.actions.associate for event handlers
+  try {
+    if (Office?.actions?.associate) {
+      Office.actions.associate("onMessageSendHandler", onMessageSendHandler);
     }
+  } catch { /* ignore */ }
 
-    validate(event, log, completeOnce).catch(err => handleError(err, event, log, completeOnce));
-  });
-}
+  // Also expose as global for older runtimes
+  try { window.onMessageSendHandler = onMessageSendHandler; } catch { /* ignore */ }
 
-window.onMessageSendHandler = onMessageSendHandler;
+  // Office.initialize is still referenced by some hosts
+  try { Office.initialize = function () {}; } catch { /* ignore */ }
+})();
