@@ -1,4 +1,4 @@
-/* global Office, OfficeRuntime */
+/* global Office, OfficeRuntifme */
 
 const LOG_KEY = "DLP_DIAG_LOGS";
 const CFG_LOG_ENABLE = "DLP_DEV_LOG_ENABLE";
