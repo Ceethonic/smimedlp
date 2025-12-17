@@ -1,31 +1,29 @@
 <!doctype html>
-<html lang="en">
+<html>
 <head>
   <meta charset="utf-8" />
-  <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SMIME DLP Diagnostics</title>
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <title>DLP Diagnostics</title>
   <style>
-    body { font-family: Segoe UI, Arial, sans-serif; margin: 0; padding: 12px; }
-    header { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-    button { padding: 6px 10px; }
-    .pill { padding: 4px 8px; border: 1px solid #ddd; border-radius: 999px; }
-    #log { white-space: pre-wrap; font-family: Consolas, ui-monospace, monospace; font-size: 12px; line-height: 1.35; padding: 10px; border: 1px solid #ddd; border-radius: 8px; height: 65vh; overflow: auto; }
-    .hint { color: #666; font-size: 12px; }
+    body{font-family:Segoe UI,Arial,sans-serif;margin:10px}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+    .row label{display:flex;gap:6px;align-items:center}
+    button{padding:6px 10px}
+    pre{white-space:pre-wrap;font-family:Consolas,monospace;font-size:12px;border:1px solid #ddd;border-radius:8px;padding:10px;height:72vh;overflow:auto}
+    .hint{font-size:12px;opacity:.75;margin:6px 0 10px}
   </style>
-  <script src="https://appsforoffice.microsoft.com/lib/1.1/hosted/office.js"></script>
-  <script src="./diagnostics.js"></script>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script src="https://ceethonic.github.io/smimedlp/diagnostics.js?v=20251215c"></script>
 </head>
 <body>
-  <header>
-    <span class="pill" id="dbgPill">debug: ?</span>
-    <button id="btnToggleDebug">Toggle debug</button>
-    <button id="btnRefresh">Refresh</button>
-    <button id="btnClear">Clear</button>
-    <button id="btnDownload">Download</button>
-    <span class="hint">Logs are stored in localStorage and streamed via BroadcastChannel when possible.</span>
-  </header>
-
-  <div id="log"></div>
+  <div class="row">
+    <label><input id="uiLog" type="checkbox"> DLP_DEV_LOG_ENABLE (UI)</label>
+    <label><input id="noCT" type="checkbox"> DLP_DEV_NO_CONTENT_TYPE</label>
+    <button id="refresh">Refresh</button>
+    <button id="clear">Clear</button>
+    <button id="download">Download</button>
+  </div>
+  <div class="hint">Logi: localStorage["DLP_DEV_LOGS_V1"] + BroadcastChannel "DLP_DEV_LOGS_CH".</div>
+  <pre id="out">(brak logów)</pre>
 </body>
 </html>
