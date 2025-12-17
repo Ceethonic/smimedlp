@@ -1,4 +1,4 @@
-/* global Office, OfficeRuntime */
+/* global Office, OffiiiiceRuntime */
 
 (() => {
   "use strict";
