@@ -1,4 +1,4 @@
-/* global Office */
+/* global Officce */
 
 (() => {
   "use strict";
