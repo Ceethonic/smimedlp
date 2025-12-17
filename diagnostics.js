@@ -1,89 +1,51 @@
+/* global Office, OfficeRuntime */
+
 (() => {
   "use strict";
+  const LOG_KEY = "smimeDlp.logs.v2";
+  const DEBUG_KEY = "smimeDlp.debug.v2";
 
-  const LOG_KEY = "smimeDlp.logs.v1";
-  const DEBUG_KEY = "smimeDlp.debug.v1";
+  async function sGet(k) {
+    try { if (OfficeRuntime?.storage) return await OfficeRuntime.storage.getItem(k); } catch {}
+    try { return localStorage.getItem(k); } catch {}
+    return null;
+  }
+  async function sSet(k, v) {
+    try { if (OfficeRuntime?.storage) return await OfficeRuntime.storage.setItem(k, v); } catch {}
+    try { localStorage.setItem(k, v); } catch {}
+  }
 
-  function loadLogs() {
+  function fmt(e) {
+    const meta = e.meta ? " " + JSON.stringify(e.meta) : "";
+    return `${e.ts} [${e.level}] [${e.tx}] ${e.msg}${meta}`;
+  }
+
+  async function render() {
+    let arr = [];
     try {
-      const raw = localStorage.getItem(LOG_KEY);
-      if (!raw) return [];
-      const arr = JSON.parse(raw);
-      return Array.isArray(arr) ? arr : [];
-    } catch {
-      return [];
-    }
+      const raw = await sGet(LOG_KEY);
+      arr = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(arr)) arr = [];
+    } catch { arr = []; }
+
+    document.getElementById("out").textContent = arr.length ? arr.map(fmt).join("\n") : "(brak logów)";
   }
 
-  function saveLogs(arr) {
-    try { localStorage.setItem(LOG_KEY, JSON.stringify(arr)); } catch { /* ignore */ }
-  }
+  Office.onReady().then(async () => {
+    const dbg = document.getElementById("dbg");
+    dbg.checked = (await sGet(DEBUG_KEY)) === "1";
 
-  function isDebug() {
-    try { return localStorage.getItem(DEBUG_KEY) === "1"; } catch { return false; }
-  }
-
-  function setDebug(v) {
-    try { localStorage.setItem(DEBUG_KEY, v ? "1" : "0"); } catch { /* ignore */ }
-  }
-
-  function formatEntry(e) {
-    const meta = e && e.meta ? " " + JSON.stringify(e.meta) : "";
-    return `${e.ts || ""} [${e.level || ""}] ${e.msg || ""}${meta}`;
-  }
-
-  function render() {
-    const logEl = document.getElementById("log");
-    const dbgPill = document.getElementById("dbgPill");
-
-    const logs = loadLogs();
-    dbgPill.textContent = `debug: ${isDebug() ? "ON" : "OFF"}`;
-
-    logEl.textContent = logs.map(formatEntry).join("\n");
-    // keep scrolled near bottom
-    logEl.scrollTop = logEl.scrollHeight;
-  }
-
-  function download() {
-    const logs = loadLogs();
-    const content = logs.map(formatEntry).join("\n") + "\n";
-    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "smimeDlp.logs.txt";
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  }
-
-  function wireUi() {
-    document.getElementById("btnRefresh").addEventListener("click", render);
-
-    document.getElementById("btnToggleDebug").addEventListener("click", () => {
-      setDebug(!isDebug());
-      render();
+    dbg.addEventListener("change", async () => {
+      await sSet(DEBUG_KEY, dbg.checked ? "1" : "0");
+      await render();
     });
 
-    document.getElementById("btnClear").addEventListener("click", () => {
-      saveLogs([]);
-      render();
+    document.getElementById("refresh").addEventListener("click", render);
+    document.getElementById("clear").addEventListener("click", async () => {
+      await sSet(LOG_KEY, JSON.stringify([]));
+      await render();
     });
 
-    document.getElementById("btnDownload").addEventListener("click", download);
-
-    // Live updates (best effort)
-    try {
-      const bc = new BroadcastChannel("smimeDlpLogs");
-      bc.onmessage = () => render();
-    } catch { /* ignore */ }
-  }
-
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => {
-      wireUi();
-      render();
-    });
-  } else {
-    wireUi();
-    render();
-  }
+    await render();
+  });
 })();
