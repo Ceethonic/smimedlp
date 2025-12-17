@@ -10,11 +10,11 @@
   <Id>9F3B66B0-4E6A-4E5B-8C6F-2B8B469C1B7A</Id>
 
   <Version>1.0.0.0</Version>
-  <ProviderName>smimedlp (DEV)</ProviderName>
+  <ProviderName>Forcepoint DLP Ratels</ProviderName>
   <DefaultLocale>pl-pl</DefaultLocale>
 
-  <DisplayName DefaultValue="smimedlp (DEV Classic OnSend)" />
-  <Description DefaultValue="DEV: Classic Outlook (outlook.exe) ItemSend + Diagnostics (GitHub Pages)." />
+  <DisplayName DefaultValue="Forcepoint DLP Ratels" />
+  <Description DefaultValue="Beta" />
 
   <!-- Ikony: dokładnie jak w oryginalnym Forcepoint -->
   <IconUrl DefaultValue="https://cdn.websense.com/addins/DLPOfficeAddin/v25.09/icon.png" />
