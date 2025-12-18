@@ -1,21 +1,9 @@
-/* global Office */
-
-// Forcepoint-like DEV implementation for classic Outlook (outlook.exe)
-// - body normalization matches Forcepoint (strip tags only, keep entities like &nbsp;)
-// - extracts <body> and removes MSO conditional comments to avoid "Clean/DocumentEmail/false..." noise
-// - attachments: getAttachmentsAsync + getAttachmentContentAsync => {file_name,data,content_type}
-// - response semantics: action === 1 => BLOCK else ALLOW
-// - restored logs + "waiting for decision" heartbeat during confirm (agent popup)
 
 let logEnable = false;
 
-// Forcepoint ports (as in original):
-// - Windows: 55299
-// - Mac:     55296
 let urlDseRoot = 'https://localhost:55299/';
 
-// Optional compat toggle for CORS/preflight in classic Outlook:
-// set localStorage: DLP_DEV_NO_CONTENT_TYPE="1" to omit Content-Type header
+
 let compatNoContentType = false;
 
 // Throttle UI progressIndicator updates (avoid UI hangs)
@@ -53,7 +41,7 @@ function printLog(text) {
   // stream to diagnostics (if available)
   try { if (_bc) _bc.postMessage(line); } catch (e) {}
 
-  // Optional: show in Outlook UI without blocking (NO sleep)
+
   if (logEnable && (typeof text === 'string' || text instanceof String)) {
     const now = Date.now();
     if (now - _lastUiLogTs > 500) {
@@ -86,9 +74,7 @@ function operatingSytem() {
   }
 }
 
-// --- HTML normalization exactly "Forcepoint-like" output ---
-// Keep entities like &nbsp; literally (do not decode), strip tags only.
-// But first remove head + MSO conditional comments + extract body.
+
 function extractBodyAndCleanMso(html) {
   let s = String(html || "");
   s = s.replace(/<head[\s\S]*?<\/head>/gi, "");
@@ -103,7 +89,7 @@ function normalizeHtmlToForcepointPlainText(htmlBody) {
   return cleaned.replace(/<[^>]+>/g, '');
 }
 
-// --- Network helpers (Forcepoint-style: fetch + AbortController timeouts) ---
+
 function fetchWithTimeout(url, options, timeoutMs) {
   if (typeof AbortController === "undefined") {
     return fetch(url, options);
@@ -142,7 +128,7 @@ async function httpServerCheck(resolve, reject) {
 async function sendToClasifier(url = '', data = {}, event) {
   printLog("Sending event to classifier");
 
-  // If agent shows confirm popup, request may hang: show heartbeat logs
+
   let waitInterval = null;
   const waitStart = setTimeout(() => {
     waitInterval = setInterval(() => {
@@ -165,7 +151,7 @@ async function sendToClasifier(url = '', data = {}, event) {
   }, 35000).then(async (response) => {
     printLog("Classifier HTTP status: " + response.status);
 
-    // RAW response for debugging real statuses (permit/confirm/block)
+   
     const raw = await response.text().catch(() => "");
     printLog("Engine raw response: " + raw);
 
@@ -200,9 +186,7 @@ function handleResponse(data, event) {
   printLog("Handling response from engine");
   let message = Office.context.mailbox.item;
 
-  // Forcepoint semantics:
-  // action === 1 -> BLOCK
-  // else -> ALLOW
+
   if (data["action"] === 1) {
     try {
       message.notificationMessages.addAsync('NoSend', { type: 'errorMessage', message: 'Blocked by DLP engine' });
@@ -461,5 +445,4 @@ function onMessageSendHandler(event) {
   });
 }
 
-// expose for manifest action mapping
 window.onMessageSendHandler = onMessageSendHandler;
