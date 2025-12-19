@@ -6,20 +6,13 @@ let compatNoContentType = false;
 
 let _lastUiLogTs = 0;
 
-(function loadDevToggles() {
-  try {
-    logEnable = (localStorage.getItem("DLP_DEV_LOG_ENABLE") === "1");
-    compatNoContentType = (localStorage.getItem("DLP_DEV_NO_CONTENT_TYPE") === "1");
-  } catch (e) {}
-})();
-
 Office.initialize = function () {};
 
 function printLog(text) {
   const line = `[${new Date().toISOString()}] ${text}`;
   try { console.log(line); } catch (e) {}
 
-  // Optional UI notification (only if enabled)
+
   if (logEnable && (typeof text === 'string' || text instanceof String)) {
     const now = Date.now();
     if (now - _lastUiLogTs > 500) {
