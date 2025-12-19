@@ -6,7 +6,7 @@
   xmlns:mailappor="http://schemas.microsoft.com/office/mailappversionoverrides"
   xsi:type="MailApp">
 
-  <!-- DEV: oddzielny GUID (żeby nie kolidować z produkcyjnym Forcepoint) -->
+
   <Id>9F3B66B0-4E6A-4E5B-8C6F-2B8B469C1B7A</Id>
 
   <Version>1.0.0.0</Version>
@@ -16,7 +16,7 @@
   <DisplayName DefaultValue="Forcepoint DLP Ratels" />
   <Description DefaultValue="Beta" />
 
-  <!-- Ikony: dokładnie jak w oryginalnym Forcepoint -->
+
   <IconUrl DefaultValue="https://cdn.websense.com/addins/DLPOfficeAddin/v25.09/icon.png" />
   <HighResolutionIconUrl DefaultValue="https://cdn.websense.com/addins/DLPOfficeAddin/v25.09/icon.png" />
 
@@ -65,17 +65,17 @@
         <Host xsi:type="MailHost">
           <DesktopFormFactor>
 
-            <!-- Function file dla ItemSend -->
+            
             <FunctionFile resid="residFunctionFileUrl" />
 
-            <!-- 1) ON-SEND (ItemSend) -->
+         
             <ExtensionPoint xsi:type="Events">
               <Event Type="ItemSend"
                      FunctionExecution="synchronous"
                      FunctionName="onMessageSendHandler" />
             </ExtensionPoint>
 
-            <!-- 2) Panel diagnostyczny (przycisk w compose) -->
+       
             <ExtensionPoint xsi:type="MessageComposeCommandSurface">
               <OfficeTab id="TabDefault">
                 <Group id="grpDev">
@@ -87,7 +87,7 @@
                       <Description resid="residBtnDesc"/>
                     </Supertip>
                     <Icon>
-                      <!-- Jedna ikona, użyta dla wszystkich rozmiarów -->
+                      
                       <bt:Image size="16" resid="residIcon16"/>
                       <bt:Image size="32" resid="residIcon32"/>
                       <bt:Image size="80" resid="residIcon80"/>
