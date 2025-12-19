@@ -6,7 +6,6 @@ let urlDseRoot = 'https://localhost:55299/';
 
 let compatNoContentType = false;
 
-// Throttle UI progressIndicator updates (avoid UI hangs)
 let _lastUiLogTs = 0;
 
 // Shared log storage for Diagnostics taskpane
